@@ -79,6 +79,9 @@
 //! runner error (preflight, install, runtime, guest crash). The specific
 //! failure mode is in `error_message`.
 
+mod stateful;
+pub use stateful::HyperlightStatefulBackend;
+
 use std::path::{Path, PathBuf};
 
 use wxc_common::logger::Logger;
@@ -91,7 +94,7 @@ use hyperlight_unikraft::{AllowList, BlockList, Preopen};
 // -- Error classification ----------------------------------------------------
 
 #[derive(Debug)]
-enum PyhlError {
+pub(crate) enum PyhlError {
     /// Pre-spawn validation failures (missing image, unsupported policy).
     Preflight(String),
     /// Runtime construction, install, or execution failure.
@@ -133,9 +136,9 @@ const DEFAULT_HOME_LEAF: &str = "pyhl";
 
 // The filenames the installer writes; duplicated here to avoid a
 // compile-time dep on internal path constants.
-const KERNEL_FILE: &str = "kernel";
-const INITRD_FILE: &str = "initrd.cpio";
-const SNAPSHOT_FILE: &str = "snapshot.hls";
+pub(crate) const KERNEL_FILE: &str = "kernel";
+pub(crate) const INITRD_FILE: &str = "initrd.cpio";
+pub(crate) const SNAPSHOT_FILE: &str = "snapshot.hls";
 
 const ERR_PROXY_POLICY: &str = "network proxy is not supported by the hyperlight backend";
 const ERR_WORKDIR: &str =
@@ -216,6 +219,7 @@ pub fn setup(force: bool, logger: &mut Logger) -> Result<PathBuf, String> {
         mounts: &[],
         network: None,
         listen_ports: None,
+        max_surrogates: Some(0),
         force,
     };
     let report = pyhl::install(&opts).map_err(|e| format!("hyperlight install: {e:#}"))?;
@@ -241,7 +245,7 @@ impl HyperlightScriptRunner {
     /// discovery chain (see module doc) and returns the first
     /// location that has at least kernel + initrd — snapshot may be
     /// missing, the runner will install it.
-    fn resolve_home() -> Result<PathBuf, PyhlError> {
+    pub(crate) fn resolve_home() -> Result<PathBuf, PyhlError> {
         for cand in Self::search_paths() {
             if has_install_source(&cand) || is_installed(&cand) {
                 return Ok(cand);
@@ -477,6 +481,7 @@ impl HyperlightScriptRunner {
                 mounts: &preopens,
                 network: network.as_ref(),
                 listen_ports: None,
+                max_surrogates: Some(0),
                 force: false,
             };
             let report = pyhl::install(&opts)
@@ -488,7 +493,7 @@ impl HyperlightScriptRunner {
         }
 
         logger.log_line(&format!("hyperlight: using image home {home:?}"));
-        let rt = pyhl::Runtime::new(home, &preopens, network.as_ref(), None)
+        let rt = pyhl::Runtime::new(home, &preopens, network.as_ref(), None, Some(0))
             .map_err(|e| PyhlError::Runtime(format!("open hyperlight runtime: {e:#}")))?;
         self.runtime = Some(rt);
         self.active_home = Some(home.to_path_buf());
@@ -581,14 +586,14 @@ impl ScriptRunner for HyperlightScriptRunner {
 // -- Helpers -----------------------------------------------------------------
 
 /// A home has a warmed snapshot (plus kernel + initrd) — ready to load.
-fn is_installed(home: &Path) -> bool {
+pub(crate) fn is_installed(home: &Path) -> bool {
     home.join(KERNEL_FILE).is_file()
         && home.join(INITRD_FILE).is_file()
         && home.join(SNAPSHOT_FILE).is_file()
 }
 
 /// A home has the raw inputs we need to auto-install a snapshot.
-fn has_install_source(home: &Path) -> bool {
+pub(crate) fn has_install_source(home: &Path) -> bool {
     home.join(KERNEL_FILE).is_file() && home.join(INITRD_FILE).is_file()
 }
 
