@@ -143,7 +143,7 @@ pub fn resolve_backend(parsed: &ParsedStateAwareRequest) -> Result<ContainmentBa
 fn backend_from_prefix(prefix: &str) -> Result<ContainmentBackend, MxcError> {
     match prefix {
         "iso" => Ok(ContainmentBackend::IsolationSession),
-        // Future state-aware backends extend this list.
+        "hl" => Ok(ContainmentBackend::Hyperlight),
         other => Err(MxcError::unsupported_containment(format!(
             "no state-aware backend registered for prefix {:?}",
             other

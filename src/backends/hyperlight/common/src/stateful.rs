@@ -46,13 +46,10 @@ use super::{has_install_source, is_installed, HyperlightScriptRunner, INITRD_FIL
 /// closure — it does not read from these handles.
 fn sentinel_pipe() -> PipeHandle {
     #[cfg(target_os = "windows")]
-    {
-        windows::Win32::Foundation::HANDLE(std::ptr::null_mut())
-    }
+    // SAFETY: HANDLE is a pointer-sized wrapper; zeroed = null handle.
+    unsafe { std::mem::zeroed() }
     #[cfg(not(target_os = "windows"))]
-    {
-        -1
-    }
+    -1
 }
 
 /// State for a single provisioned + started session.
