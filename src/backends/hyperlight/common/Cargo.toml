@@ -8,7 +8,7 @@ license.workspace = true
 wxc_common = { workspace = true }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
-hyperlight-unikraft-host = { path = "../../../../../hyperlight-unikraft/host", optional = true }
+hyperlight-unikraft-host = { git = "https://github.com/hyperlight-dev/hyperlight-unikraft.git", branch = "experiment/use-hyperlight-main", optional = true }
 
 [features]
 default = []
