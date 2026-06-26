@@ -12,7 +12,7 @@ use appcontainer_common::appcontainer_runner::{
 };
 use clap::Parser;
 #[cfg(all(feature = "hyperlight", target_arch = "x86_64"))]
-use hyperlight_common::HyperlightScriptRunner;
+use hyperlight_common::{HyperlightScriptRunner, HyperlightStatefulBackend};
 #[cfg(feature = "isolation_session")]
 use isolation_session_common::IsolationSessionRunner;
 #[cfg(feature = "microvm")]
@@ -266,6 +266,11 @@ fn dispatch_state_aware_request(
 ) -> Result<DispatchOutcome, MxcError> {
     let backend = resolve_backend(&parsed)?;
     match backend {
+        #[cfg(all(feature = "hyperlight", target_arch = "x86_64"))]
+        wxc_common::models::ContainmentBackend::Hyperlight => {
+            let mut runner = HyperlightStatefulBackend::new();
+            dispatch_state_aware(&mut runner, parsed, dry_run)
+        }
         #[cfg(all(target_os = "windows", feature = "isolation_session"))]
         wxc_common::models::ContainmentBackend::IsolationSession => {
             let mut runner = isolation_session_common::IsolationSessionRunner::new();
