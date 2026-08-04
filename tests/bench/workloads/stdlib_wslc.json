@@ -1,0 +1,17 @@
+{
+    "version": "0.5.0-alpha",
+    "containerId": "bench-wslc-stdlib",
+    "containment": "wslc",
+    "process": {
+        "commandLine": "python3 -c \"import sys, json, hashlib, os, time; t0=time.time(); data=json.dumps({'key':'value','list':list(range(100))}); h=hashlib.sha256(data.encode()).hexdigest(); print(f'stdlib test: json={len(data)}b sha256={h[:16]}...'); print(f'Python {sys.version.split()[0]} on {sys.platform}'); print(f'ELAPSED_GUEST_MS={int((time.time()-t0)*1000)}')\"",
+        "timeout": 30000
+    },
+    "network": {
+        "defaultPolicy": "block"
+    },
+    "experimental": {
+        "wslc": {
+            "image": "python:3.12-alpine"
+        }
+    }
+}

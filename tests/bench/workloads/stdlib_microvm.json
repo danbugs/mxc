@@ -1,0 +1,7 @@
+{
+    "process": {
+        "commandLine": "import sys, json, hashlib, os, time\nt0 = time.time()\ndata = json.dumps({'key': 'value', 'list': list(range(100))})\nh = hashlib.sha256(data.encode()).hexdigest()\nprint(f'stdlib test: json={len(data)}b sha256={h[:16]}...')\nprint(f'Python {sys.version.split()[0]} on {sys.platform}')\nprint(f'ELAPSED_GUEST_MS={int((time.time()-t0)*1000)}')",
+        "timeout": 30000
+    },
+    "containment": "microvm"
+}

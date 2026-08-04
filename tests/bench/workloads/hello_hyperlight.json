@@ -1,0 +1,7 @@
+{
+    "process": {
+        "commandLine": "import sys, time; t0=time.time(); print(f'Hello from Hyperlight! Python {sys.version.split()[0]} on {sys.platform}'); print(f'ELAPSED_GUEST_MS={int((time.time()-t0)*1000)}')",
+        "timeout": 30000
+    },
+    "containment": "hyperlight"
+}
