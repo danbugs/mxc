@@ -36,8 +36,14 @@
 .EXAMPLE
     .\bench_containments.ps1 -Backends hyperlight,microvm -Iterations 20
 
+.PARAMETER OutputHtml
+    Path to write an HTML report with charts. Optional.
+
 .EXAMPLE
     .\bench_containments.ps1 -Workload stdlib -OutputJson results.json
+
+.EXAMPLE
+    .\bench_containments.ps1 -Backends hyperlight,microvm,wslc -OutputHtml report.html
 #>
 
 [CmdletBinding()]
@@ -47,6 +53,7 @@ param(
     [int]$Iterations = 10,
     [int]$WarmupIterations = 1,
     [string]$OutputJson = "",
+    [string]$OutputHtml = "",
     [switch]$SkipSetup,
     [string]$WxcExe = "",
     [string]$WslcImage = "python:3.12-alpine"
@@ -70,9 +77,9 @@ function Find-WxcExe {
     $candidates = @()
     foreach ($profile in $profiles) {
         foreach ($triple in $triples) {
-            $candidates += Join-Path $srcDir "target" $triple $profile "wxc-exec.exe"
+            $candidates += Join-Path (Join-Path (Join-Path (Join-Path $srcDir "target") $triple) $profile) "wxc-exec.exe"
         }
-        $candidates += Join-Path $srcDir "target" $profile "wxc-exec.exe"
+        $candidates += Join-Path (Join-Path (Join-Path $srcDir "target") $profile) "wxc-exec.exe"
     }
 
     $found = $candidates | Where-Object { Test-Path $_ } |
@@ -91,7 +98,7 @@ function Find-WxcExe {
 
 function Test-HyperlightAvailable {
     param([string]$ExeDir)
-    $snapshot = Join-Path $env:LOCALAPPDATA "pyhl" "snapshot" "index.json"
+    $snapshot = Join-Path (Join-Path (Join-Path $env:LOCALAPPDATA "pyhl") "snapshot") "index.json"
     return (Test-Path $snapshot)
 }
 
@@ -106,7 +113,7 @@ function Test-MicrovmAvailable {
         }
     }
     if ($allPresent) {
-        $allPresent = Test-Path (Join-Path $ExeDir "bin" "kernel.elf")
+        $allPresent = Test-Path (Join-Path (Join-Path $ExeDir "bin") "kernel.elf")
     }
     return $allPresent
 }
@@ -179,37 +186,35 @@ function Invoke-Iteration {
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
-    $proc = Start-Process -FilePath $Exe `
-        -ArgumentList (@($ConfigPath) + $extraArgs) `
-        -NoNewWindow -Wait -PassThru `
-        -RedirectStandardOutput "$env:TEMP\bench_stdout.txt" `
-        -RedirectStandardError "$env:TEMP\bench_stderr.txt"
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $output = & $Exe $ConfigPath $extraArgs 2>&1
+    $exitCode = $LASTEXITCODE
+    $ErrorActionPreference = $prevEAP
 
     $sw.Stop()
 
-    $stdout = ""
-    if (Test-Path "$env:TEMP\bench_stdout.txt") {
-        $stdout = Get-Content "$env:TEMP\bench_stdout.txt" -Raw -ErrorAction SilentlyContinue
-    }
-    $stderr = ""
-    if (Test-Path "$env:TEMP\bench_stderr.txt") {
-        $stderr = Get-Content "$env:TEMP\bench_stderr.txt" -Raw -ErrorAction SilentlyContinue
-    }
+    $combined = ($output | Out-String)
 
-    # Try to extract peak working set from the process (best-effort).
-    $peakWsMb = -1
-    try {
-        if ($null -ne $proc -and $null -ne $proc.PeakWorkingSet64) {
-            $peakWsMb = [math]::Round($proc.PeakWorkingSet64 / 1MB, 2)
-        }
-    } catch {}
+    # Parse restore/call timing from hyperlight/nanvix log lines if present
+    $restoreMs = -1
+    $callMs = -1
+    $runnerMs = -1
+    if ($combined -match 'restore=([0-9.]+)ms\s+call=([0-9.]+)ms') {
+        $restoreMs = [double]$Matches[1]
+        $callMs = [double]$Matches[2]
+    }
+    if ($combined -match 'Runner completed in (\d+)ms') {
+        $runnerMs = [double]$Matches[1]
+    }
 
     return @{
-        ExitCode     = $proc.ExitCode
-        ElapsedMs    = $sw.Elapsed.TotalMilliseconds
-        PeakWsMb     = $peakWsMb
-        Stdout       = $stdout
-        Stderr       = $stderr
+        ExitCode   = $exitCode
+        ElapsedMs  = $sw.Elapsed.TotalMilliseconds
+        RunnerMs   = $runnerMs
+        RestoreMs  = $restoreMs
+        CallMs     = $callMs
+        Output     = $combined
     }
 }
 
@@ -274,7 +279,7 @@ Write-Host "Iterations: $Iterations (+ $WarmupIterations warmup)" -ForegroundCol
 
 # Resolve workload config directory
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$workloadDir = Join-Path $repoRoot "tests" "bench" "workloads"
+$workloadDir = Join-Path (Join-Path (Join-Path $repoRoot "tests") "bench") "workloads"
 if (-not (Test-Path $workloadDir)) {
     Write-Error "Workload directory not found: $workloadDir"
     exit 1
@@ -309,7 +314,8 @@ foreach ($backend in $selectedBackends) {
     Write-Host "`n=== Benchmarking: $backend ($Workload) ===" -ForegroundColor Yellow
 
     $timings = @()
-    $peakMemory = @()
+    $callTimings = @()
+    $restoreTimings = @()
     $failures = 0
     $totalRuns = $WarmupIterations + $Iterations
 
@@ -330,28 +336,39 @@ foreach ($backend in $selectedBackends) {
             if (-not $isWarmup) { $failures++ }
         }
 
-        $memStr = if ($result.PeakWsMb -ge 0) { "$($result.PeakWsMb) MB" } else { "n/a" }
-        Write-Host "$([math]::Round($result.ElapsedMs, 1)) ms | mem=$memStr | $status" -ForegroundColor $color
+        $detail = ""
+        if ($result.RunnerMs -ge 0) {
+            $detail += " | runner=$([math]::Round($result.RunnerMs,1))ms"
+        }
+        if ($result.RestoreMs -ge 0) {
+            $detail += " restore=$([math]::Round($result.RestoreMs,1))ms call=$([math]::Round($result.CallMs,1))ms"
+        }
+        Write-Host "$([math]::Round($result.ElapsedMs, 1)) ms$detail | $status" -ForegroundColor $color
 
         if (-not $isWarmup) {
             $timings += $result.ElapsedMs
-            if ($result.PeakWsMb -ge 0) {
-                $peakMemory += $result.PeakWsMb
+            if ($result.CallMs -ge 0) {
+                $callTimings += $result.CallMs
+            }
+            if ($result.RestoreMs -ge 0) {
+                $restoreTimings += $result.RestoreMs
             }
         }
     }
 
     $stats = Get-Stats $timings
-    $memStats = if ($peakMemory.Count -gt 0) { Get-Stats $peakMemory } else { $null }
+    $callStats = if ($callTimings.Count -gt 0) { Get-Stats $callTimings } else { $null }
+    $restoreStats = if ($restoreTimings.Count -gt 0) { Get-Stats $restoreTimings } else { $null }
 
     $allResults[$backend] = @{
-        Backend      = $backend
-        Workload     = $Workload
-        Iterations   = $Iterations
-        Failures     = $failures
-        TimingMs     = $stats
-        PeakMemoryMb = $memStats
-        RawTimings   = $timings
+        Backend        = $backend
+        Workload       = $Workload
+        Iterations     = $Iterations
+        Failures       = $failures
+        TimingMs       = $stats
+        CallMs         = $callStats
+        RestoreMs      = $restoreStats
+        RawTimings     = $timings
     }
 }
 
@@ -362,10 +379,12 @@ Write-Host ("=" * 80) -ForegroundColor Cyan
 Write-Host "  BENCHMARK RESULTS: $Workload workload ($Iterations iterations)" -ForegroundColor Cyan
 Write-Host ("=" * 80) -ForegroundColor Cyan
 
+Write-Host ""
+Write-Host "  Wall-clock (total wxc-exec time):" -ForegroundColor White
 $header = "{0,-15} {1,10} {2,10} {3,10} {4,10} {5,10} {6,10} {7,10}" -f `
     "Backend", "Min(ms)", "Median", "Mean", "P90", "P99", "Max(ms)", "Fails"
 Write-Host $header -ForegroundColor White
-Write-Host ("-" * 80)
+Write-Host ("-" * 95)
 
 foreach ($backend in $selectedBackends) {
     if (-not $allResults.ContainsKey($backend)) { continue }
@@ -377,18 +396,19 @@ foreach ($backend in $selectedBackends) {
     Write-Host $row
 }
 
-if ($allResults.Values | Where-Object { $_.PeakMemoryMb }) {
+if ($allResults.Values | Where-Object { $_.CallMs }) {
     Write-Host ""
-    $memHeader = "{0,-15} {1,12} {2,12} {3,12} {4,12}" -f `
-        "Backend", "MinMem(MB)", "MedMem", "MeanMem", "MaxMem"
-    Write-Host $memHeader -ForegroundColor White
-    Write-Host ("-" * 65)
+    Write-Host "  Guest call time (inside the VM):" -ForegroundColor White
+    $callHeader = "{0,-15} {1,10} {2,10} {3,10} {4,10} {5,10}" -f `
+        "Backend", "Min(ms)", "Median", "Mean", "P90", "Max(ms)"
+    Write-Host $callHeader -ForegroundColor White
+    Write-Host ("-" * 70)
     foreach ($backend in $selectedBackends) {
         if (-not $allResults.ContainsKey($backend)) { continue }
-        $m = $allResults[$backend].PeakMemoryMb
-        if ($m) {
-            $row = "{0,-15} {1,12} {2,12} {3,12} {4,12}" -f `
-                $backend, $m.Min, $m.Median, $m.Mean, $m.Max
+        $c = $allResults[$backend].CallMs
+        if ($c) {
+            $row = "{0,-15} {1,10} {2,10} {3,10} {4,10} {5,10}" -f `
+                $backend, $c.Min, $c.Median, $c.Mean, $c.P90, $c.Max
             Write-Host $row
         }
     }
@@ -415,10 +435,305 @@ if ($OutputJson -ne "") {
             iterations   = $r.Iterations
             failures     = $r.Failures
             timingMs     = $r.TimingMs
-            peakMemoryMb = $r.PeakMemoryMb
+            callMs       = $r.CallMs
+            restoreMs    = $r.RestoreMs
             rawTimingsMs = $r.RawTimings
         }
     }
     $jsonObj | ConvertTo-Json -Depth 5 | Set-Content -Path $OutputJson -Encoding UTF8
     Write-Host "Results written to: $OutputJson" -ForegroundColor Green
+}
+
+# --- HTML chart output ---
+
+if ($OutputHtml -ne "" -and $allResults.Count -gt 0) {
+    $backendColors = @{
+        "hyperlight" = "#3B6CE7"
+        "microvm"    = "#1B9E6D"
+        "wslc"       = "#C05621"
+    }
+    $backendLabels = @{
+        "hyperlight" = "Hyperlight (Unikraft)"
+        "microvm"    = "NanVix (Microvm)"
+        "wslc"       = "WSLc"
+    }
+
+    # Build JS data object
+    $jsData = "{"
+    foreach ($backend in $selectedBackends) {
+        if (-not $allResults.ContainsKey($backend)) { continue }
+        $r = $allResults[$backend]
+        $rawArr = ($r.RawTimings | ForEach-Object { [math]::Round($_, 2) }) -join ","
+        $label = $backendLabels[$backend]
+        $color = $backendColors[$backend]
+        $t = $r.TimingMs
+        $jsData += "`n      '$backend': {"
+        $jsData += " label: '$label', color: '$color',"
+        $jsData += " raw: [$rawArr],"
+        $jsData += " min: $($t.Min), median: $($t.Median), mean: $($t.Mean),"
+        $jsData += " p90: $($t.P90), p99: $($t.P99), max: $($t.Max), stddev: $($t.StdDev),"
+        $jsData += " failures: $($r.Failures)"
+        if ($r.CallMs) {
+            $c = $r.CallMs
+            $jsData += ", call: { min: $($c.Min), median: $($c.Median), mean: $($c.Mean), p90: $($c.P90), max: $($c.Max) }"
+        }
+        if ($r.RestoreMs) {
+            $rs = $r.RestoreMs
+            $jsData += ", restore: { min: $($rs.Min), median: $($rs.Median), mean: $($rs.Mean), p90: $($rs.P90), max: $($rs.Max) }"
+        }
+        $jsData += " },"
+    }
+    $jsData += "`n    }"
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm"
+    $hostname = $env:COMPUTERNAME
+
+    $html = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MXC Benchmark: $Workload</title>
+<style>
+  :root {
+    --bg: #F6F7F9; --surface: #FFF; --text: #1A1D23; --text2: #5A6172;
+    --border: #D8DAE0; --grid: #E8EAEF;
+    --mono: ui-monospace, "Cascadia Code", "SF Mono", Menlo, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #15161A; --surface: #1D1E24; --text: #E4E5EA; --text2: #8B90A0; --border: #2E3038; --grid: #252730; }
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font-family: var(--sans); line-height: 1.5; padding: 2rem 1rem; }
+  .c { max-width: 860px; margin: 0 auto; }
+  .eyebrow { font-size: .7rem; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--text2); margin-bottom: .25rem; }
+  h1 { font-size: 1.4rem; font-weight: 700; margin-bottom: .4rem; }
+  .sub { font-size: .85rem; color: var(--text2); margin-bottom: 1.5rem; }
+  .cards { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.5rem; }
+  .card { flex: 1; min-width: 140px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: .85rem 1rem; }
+  .card-label { font-size: .7rem; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--text2); }
+  .card-val { font-family: var(--mono); font-size: 1.6rem; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.3; }
+  .card-note { font-size: .72rem; color: var(--text2); }
+  .section { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 1.25rem; margin-bottom: 1.5rem; }
+  .stitle { font-size: .78rem; font-weight: 600; color: var(--text2); margin-bottom: .75rem; }
+  canvas { display: block; width: 100%; height: auto; }
+  .legend { display: flex; gap: 1.25rem; margin-top: .75rem; justify-content: center; flex-wrap: wrap; }
+  .legend-item { display: flex; align-items: center; gap: .35rem; font-size: .78rem; color: var(--text2); }
+  .legend-dot { width: 8px; height: 8px; border-radius: 50%; }
+  .tbl-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th { font-size: .68rem; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--text2); text-align: right; padding: .45rem .75rem; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th:first-child { text-align: left; }
+  td { font-family: var(--mono); font-size: .8rem; text-align: right; padding: .55rem .75rem; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+  td:first-child { font-family: var(--sans); font-weight: 600; text-align: left; }
+  tr:last-child td { border-bottom: none; }
+  footer { text-align: center; font-size: .7rem; color: var(--text2); padding-top: .5rem; }
+</style>
+</head>
+<body>
+<div class="c">
+  <div class="eyebrow">MXC Containment Benchmark</div>
+  <h1>$Workload workload &mdash; Wall-Clock Execution</h1>
+  <div class="sub">$Iterations iterations &middot; $hostname &middot; $timestamp</div>
+  <div class="cards" id="cards"></div>
+  <div class="section">
+    <div class="stitle">Distribution of wall-clock times (ms)</div>
+    <canvas id="strip" width="1520" height="200"></canvas>
+    <div class="legend" id="legend1"></div>
+  </div>
+  <div class="section">
+    <div class="stitle">Per-iteration comparison</div>
+    <canvas id="line" width="1520" height="360"></canvas>
+    <div class="legend" id="legend2"></div>
+  </div>
+  <div class="section" style="padding:0; overflow:hidden;">
+    <div style="padding:.85rem 1rem .5rem; font-size:.78rem; font-weight:600; color:var(--text2);">Summary (ms)</div>
+    <div class="tbl-wrap"><table id="stats"></table></div>
+  </div>
+  <footer>wxc-exec release build &middot; WHP snapshots</footer>
+</div>
+<script>
+const D = $jsData;
+const BACKENDS = Object.keys(D);
+function css(p) { return getComputedStyle(document.documentElement).getPropertyValue(p).trim(); }
+
+// Cards
+(function() {
+  const el = document.getElementById('cards');
+  BACKENDS.forEach(k => {
+    const d = D[k];
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = '<div class="card-label">' + d.label + '</div>'
+      + '<div class="card-val" style="color:' + d.color + '">' + d.median + '<span style="font-size:.7rem;opacity:.7"> ms</span></div>'
+      + '<div class="card-note">median wall-clock' + (d.failures > 0 ? ' &middot; ' + d.failures + ' failures' : '') + '</div>';
+    el.appendChild(card);
+  });
+  if (BACKENDS.length >= 2) {
+    const vals = BACKENDS.map(k => D[k].median).sort((a,b) => a - b);
+    const ratio = (vals[vals.length - 1] / vals[0]).toFixed(1);
+    const fastest = BACKENDS.reduce((a, b) => D[a].median < D[b].median ? a : b);
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = '<div class="card-label">Spread</div>'
+      + '<div class="card-val">' + ratio + '<span style="font-size:.7rem;opacity:.7">x</span></div>'
+      + '<div class="card-note">' + D[fastest].label + ' fastest</div>';
+    el.appendChild(card);
+  }
+})();
+
+function setupCanvas(id) {
+  const c = document.getElementById(id);
+  const dpr = window.devicePixelRatio || 1;
+  const w = c.width, h = c.height;
+  c.style.width = (w/2) + 'px'; c.style.height = (h/2) + 'px';
+  c.width = w * dpr; c.height = h * dpr;
+  const ctx = c.getContext('2d'); ctx.scale(dpr, dpr);
+  return { ctx, W: w, H: h };
+}
+
+function legend(id) {
+  const el = document.getElementById(id);
+  BACKENDS.forEach(k => {
+    const d = D[k];
+    const item = document.createElement('div'); item.className = 'legend-item';
+    item.innerHTML = '<div class="legend-dot" style="background:' + d.color + '"></div>' + d.label;
+    el.appendChild(item);
+  });
+}
+
+function drawStrip() {
+  const { ctx, W, H } = setupCanvas('strip');
+  const pad = { top: 20, right: 40, bottom: 40, left: 110 };
+  const allVals = BACKENDS.flatMap(k => D[k].raw);
+  const xMin = Math.floor(Math.min(...allVals) / 50) * 50 - 20;
+  const xMax = Math.ceil(Math.max(...allVals) / 50) * 50 + 20;
+  const plotW = W - pad.left - pad.right;
+  const rowH = (H - pad.top - pad.bottom) / BACKENDS.length;
+  const xScale = v => pad.left + ((v - xMin) / (xMax - xMin)) * plotW;
+
+  // grid
+  const gridColor = css('--grid'), text2 = css('--text2');
+  ctx.strokeStyle = gridColor; ctx.lineWidth = 1;
+  const step = xMax - xMin > 500 ? 500 : xMax - xMin > 200 ? 100 : 20;
+  for (let v = Math.ceil(xMin/step)*step; v <= xMax; v += step) {
+    const x = Math.round(xScale(v)) + 0.5;
+    ctx.beginPath(); ctx.moveTo(x, pad.top); ctx.lineTo(x, H - pad.bottom); ctx.stroke();
+  }
+  ctx.font = '11px ' + css('--mono'); ctx.fillStyle = text2; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  for (let v = Math.ceil(xMin/step)*step; v <= xMax; v += step) ctx.fillText(v+'', xScale(v), H - pad.bottom + 6);
+  ctx.font = '11px ' + css('--sans'); ctx.fillText('Wall-clock (ms)', pad.left + plotW/2, H - pad.bottom + 22);
+
+  BACKENDS.forEach((k, i) => {
+    const d = D[k], cy = pad.top + rowH * (i + 0.5), bandH = Math.min(28, rowH * 0.6);
+    // label
+    ctx.font = '600 12px ' + css('--sans'); ctx.fillStyle = d.color;
+    ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+    ctx.fillText(d.label.split('(')[0].trim(), pad.left - 10, cy);
+    // range band
+    const rMin = Math.min(...d.raw), rMax = Math.max(...d.raw);
+    ctx.fillStyle = d.color + '20';
+    ctx.beginPath();
+    const bx = xScale(rMin), bw = xScale(rMax) - bx;
+    ctx.roundRect(bx, cy - bandH/2, bw, bandH, 3); ctx.fill();
+    // median line
+    ctx.strokeStyle = d.color; ctx.globalAlpha = .5; ctx.lineWidth = 2; ctx.setLineDash([4,3]);
+    ctx.beginPath(); ctx.moveTo(xScale(d.median), cy - bandH/2 - 4); ctx.lineTo(xScale(d.median), cy + bandH/2 + 4); ctx.stroke();
+    ctx.globalAlpha = 1; ctx.setLineDash([]);
+    // dots
+    d.raw.forEach((v, j) => {
+      const jitter = (j % 3 - 1) * 4;
+      ctx.beginPath(); ctx.arc(xScale(v), cy + jitter, 4, 0, Math.PI*2);
+      ctx.fillStyle = d.color; ctx.fill();
+    });
+    // median label
+    ctx.font = '600 10px ' + css('--mono'); ctx.fillStyle = d.color;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+    ctx.fillText(d.median + ' ms', xScale(d.median), cy - bandH/2 - 7);
+  });
+  legend('legend1');
+}
+
+function drawLine() {
+  const { ctx, W, H } = setupCanvas('line');
+  const pad = { top: 20, right: 30, bottom: 48, left: 55 };
+  const plotW = W - pad.left - pad.right, plotH = H - pad.top - pad.bottom;
+  const allVals = BACKENDS.flatMap(k => D[k].raw);
+  const yMin = Math.floor(Math.min(...allVals) / 50) * 50 - 20;
+  const yMax = Math.ceil(Math.max(...allVals) / 50) * 50 + 20;
+  const n = Math.max(...BACKENDS.map(k => D[k].raw.length));
+  const xPos = i => pad.left + (i / (n - 1)) * plotW;
+  const yPos = v => pad.top + plotH - ((v - yMin) / (yMax - yMin)) * plotH;
+
+  const gridColor = css('--grid'), text2 = css('--text2');
+  // y grid
+  ctx.strokeStyle = gridColor; ctx.lineWidth = 1;
+  const yStep = yMax - yMin > 1000 ? 500 : yMax - yMin > 200 ? 100 : 20;
+  ctx.font = '11px ' + css('--mono'); ctx.fillStyle = text2;
+  ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+  for (let v = Math.ceil(yMin/yStep)*yStep; v <= yMax; v += yStep) {
+    const y = Math.round(yPos(v)) + 0.5;
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(W - pad.right, y); ctx.stroke();
+    ctx.fillText(v+'', pad.left - 7, y);
+  }
+  // x labels
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  for (let i = 0; i < n; i++) ctx.fillText('#'+(i+1), xPos(i), H - pad.bottom + 7);
+  ctx.font = '11px ' + css('--sans'); ctx.fillText('Iteration', pad.left + plotW/2, H - pad.bottom + 24);
+
+  BACKENDS.forEach(k => {
+    const d = D[k];
+    // area
+    ctx.beginPath(); ctx.moveTo(xPos(0), yPos(yMin));
+    d.raw.forEach((v, i) => ctx.lineTo(xPos(i), yPos(v)));
+    ctx.lineTo(xPos(d.raw.length - 1), yPos(yMin)); ctx.closePath();
+    ctx.fillStyle = d.color + '18'; ctx.fill();
+    // line
+    ctx.beginPath(); d.raw.forEach((v, i) => { if (i === 0) ctx.moveTo(xPos(0), yPos(v)); else ctx.lineTo(xPos(i), yPos(v)); });
+    ctx.strokeStyle = d.color; ctx.lineWidth = 2.5; ctx.lineJoin = 'round'; ctx.stroke();
+    // dots
+    d.raw.forEach((v, i) => {
+      ctx.beginPath(); ctx.arc(xPos(i), yPos(v), 3.5, 0, Math.PI*2);
+      ctx.fillStyle = css('--surface'); ctx.fill();
+      ctx.strokeStyle = d.color; ctx.lineWidth = 2; ctx.stroke();
+    });
+  });
+  legend('legend2');
+}
+
+// Table
+(function() {
+  const tbl = document.getElementById('stats');
+  let h = '<thead><tr><th>Backend</th><th>Min</th><th>Median</th><th>Mean</th><th>P90</th><th>P99</th><th>Max</th><th>StdDev</th><th>Fails</th></tr></thead><tbody>';
+  BACKENDS.forEach(k => {
+    const d = D[k];
+    h += '<tr><td style="color:' + d.color + '">' + d.label + '</td>';
+    h += '<td>' + d.min + '</td><td>' + d.median + '</td><td>' + d.mean + '</td>';
+    h += '<td>' + d.p90 + '</td><td>' + d.p99 + '</td><td>' + d.max + '</td>';
+    h += '<td>' + d.stddev + '</td><td>' + d.failures + '</td></tr>';
+  });
+  if (BACKENDS.length >= 2) {
+    const fastest = BACKENDS.reduce((a, b) => D[a].median < D[b].median ? a : b);
+    const slowest = BACKENDS.reduce((a, b) => D[a].median > D[b].median ? a : b);
+    if (fastest !== slowest) {
+      const delta = (D[slowest].median - D[fastest].median).toFixed(2);
+      h += '<tr><td style="font-weight:400;color:' + css('--text2') + '">Delta (fastest&rarr;slowest)</td>';
+      h += '<td></td><td style="color:#1B9E6D;font-weight:600">+' + delta + '</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>';
+    }
+  }
+  h += '</tbody>';
+  tbl.innerHTML = h;
+})();
+
+drawStrip();
+drawLine();
+</script>
+</body>
+</html>
+"@
+
+    Set-Content -Path $OutputHtml -Value $html -Encoding UTF8
+    Write-Host "HTML report written to: $OutputHtml" -ForegroundColor Green
 }
