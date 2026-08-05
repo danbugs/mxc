@@ -54,9 +54,14 @@ struct Cli {
     config: Option<String>,
 
     /// Workload to run: "hello" (trivial print) or "compute" (~150ms CPU work).
-    /// Ignored when --config is set.
+    /// Ignored when --config or --workloads is set.
     #[arg(long, default_value = "hello")]
     workload: String,
+
+    /// Comma-separated list of workloads for --full mode (e.g. "hello,compute").
+    /// Runs all benchmarks for each workload; the HTML report gets tabs.
+    #[arg(long, value_delimiter = ',')]
+    workloads: Option<Vec<String>>,
 
     /// WSLc container image (default: python:3.12-alpine).
     #[arg(long, default_value = "python:3.12-alpine")]
@@ -379,6 +384,7 @@ const HELLO_PY: &str = "import sys, time; t0=time.time(); print(f'Hello from lib
 /// Python source for the "compute" workload (~100-200ms CPU-bound).
 /// Fibonacci is a pure-Python CPU benchmark with no dependencies.
 const COMPUTE_PY: &str = r#"import sys, time
+sys.set_int_max_str_digits(100000)
 t0 = time.time()
 a, b = 0, 1
 for _ in range(200000):
@@ -623,6 +629,8 @@ struct DensityResult {
     /// - Ephemeral backends (NanVix/WSLc): peak per-execution + daemon
     density_cost_mb: f64,
     fits_in_1500mb: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
 }
 
 /// Polls process WS and external daemon WS in a background thread during
@@ -846,6 +854,16 @@ fn density_test(
             "  [{name}] => Density cost: {density_cost:.1} MB/runner  (~{fits} fit in 1.5 GB)"
         );
 
+        // WSLc containers run inside a WSL2 lightweight VM — the actual container
+        // memory (Linux kernel, Python runtime) lives in the VM's address space and
+        // is not visible in any Windows process's working set. The numbers here
+        // capture only the Windows-side IPC/handle overhead.
+        let note = if matches!(backend, ContainmentBackend::Wslc) {
+            Some("Windows-side overhead only — container memory lives in WSL2 VM, not visible in host process WS".into())
+        } else {
+            None
+        };
+
         results.push(DensityResult {
             backend: name.to_string(),
             count: alive,
@@ -865,6 +883,7 @@ fn density_test(
             per_runner_daemon_mb: per_runner_daemon,
             density_cost_mb: density_cost,
             fits_in_1500mb: fits,
+            note,
         });
 
         // Drop runners before next backend
@@ -1087,6 +1106,15 @@ struct ColdStartResult {
     error: Option<String>,
 }
 
+/// Escape a string for embedding in JSON (handles newlines, quotes, backslashes).
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
 /// Write a temp wxc-exec config for the given backend + workload.
 fn write_temp_config(
     backend: &ContainmentBackend,
@@ -1094,14 +1122,13 @@ fn write_temp_config(
     workload: &str,
 ) -> std::path::PathBuf {
     let py_src = workload_py_src(workload);
+    let escaped = json_escape(py_src);
     let json = match backend {
         ContainmentBackend::Hyperlight => format!(
-            r#"{{"process":{{"commandLine":"{}","timeout":30000}},"containment":"hyperlight"}}"#,
-            py_src.replace('\\', "\\\\").replace('"', "\\\"")
+            r#"{{"process":{{"commandLine":"{escaped}","timeout":30000}},"containment":"hyperlight"}}"#,
         ),
         ContainmentBackend::MicroVm => format!(
-            r#"{{"process":{{"commandLine":"{}","timeout":30000}},"containment":"microvm"}}"#,
-            py_src.replace('\\', "\\\\").replace('"', "\\\"")
+            r#"{{"process":{{"commandLine":"{escaped}","timeout":30000}},"containment":"microvm"}}"#,
         ),
         ContainmentBackend::Wslc => {
             let cmd = format!("python3 -c \\\"{}\\\"", py_src.replace('\n', "; ").replace('"', "\\\""));
@@ -1237,6 +1264,8 @@ struct DiskResult {
     backend: String,
     total_mb: f64,
     files: Vec<DiskFile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1244,6 +1273,42 @@ struct DiskFile {
     name: String,
     logical_mb: f64,
     actual_mb: f64,
+}
+
+/// Measure a single file's disk usage (sparse-aware on Windows).
+fn measure_file(path: &std::path::Path) -> Option<DiskFile> {
+    if !path.exists() {
+        return None;
+    }
+    let logical = path.metadata().map(|m| m.len() as f64 / (1024.0 * 1024.0)).unwrap_or(0.0);
+    #[cfg(target_os = "windows")]
+    let actual = file_actual_size_mb(path);
+    #[cfg(not(target_os = "windows"))]
+    let actual = logical;
+    Some(DiskFile {
+        name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+        logical_mb: logical,
+        actual_mb: actual,
+    })
+}
+
+/// Recursively measure all files in a directory (sparse-aware).
+fn measure_dir_recursive(dir: &std::path::Path) -> Vec<DiskFile> {
+    let mut files = Vec::new();
+    if !dir.is_dir() {
+        return files;
+    }
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(measure_dir_recursive(&path));
+            } else if let Some(f) = measure_file(&path) {
+                files.push(f);
+            }
+        }
+    }
+    files
 }
 
 fn measure_disk(backend: &ContainmentBackend) -> DiskResult {
@@ -1254,40 +1319,75 @@ fn measure_disk(backend: &ContainmentBackend) -> DiskResult {
         .expect("exe parent")
         .to_path_buf();
 
-    let file_list: Vec<std::path::PathBuf> = match backend {
-        ContainmentBackend::Hyperlight => vec![
-            exe_dir.join("snapshots").join("kernel.vmem"),
-            exe_dir.join("snapshots").join("kernel.whp.cbor"),
-        ],
-        ContainmentBackend::MicroVm => vec![
-            exe_dir.join("nanvixd.exe"),
-            exe_dir.join("nanvix_rootfs.img"),
-            exe_dir.join("python3.initrd"),
-        ],
-        ContainmentBackend::Wslc => vec![],  // OCI cache, hard to measure
-        _ => vec![],
-    };
+    match backend {
+        ContainmentBackend::Hyperlight => {
+            // Hyperlight's snapshot lives in %LOCALAPPDATA%\pyhl\snapshot\ (installed
+            // by `wxc-exec --setup-hyperlight`). The snapshot blob is NTFS sparse —
+            // we measure actual on-disk allocation. The initrd.cpio is baked into the
+            // snapshot, so only the snapshot directory counts.
+            let snapshot_dir = resolve_localappdata().join("pyhl").join("snapshot");
+            if snapshot_dir.is_dir() {
+                let files = measure_dir_recursive(&snapshot_dir);
+                let total: f64 = files.iter().map(|f| f.actual_mb).sum();
+                eprintln!("  [Hyperlight] disk: {total:.1} MB actual in {}", snapshot_dir.display());
+                for f in &files {
+                    if f.actual_mb > 1.0 {
+                        eprintln!("    {} — logical={:.1} MB, on-disk={:.1} MB", f.name, f.logical_mb, f.actual_mb);
+                    }
+                }
+                DiskResult { backend: name.to_string(), total_mb: total, files, note: None }
+            } else {
+                eprintln!("  [Hyperlight] disk: snapshot not found at {}", snapshot_dir.display());
+                DiskResult {
+                    backend: name.to_string(), total_mb: 0.0, files: vec![],
+                    note: Some(format!("snapshot not found at {}", snapshot_dir.display())),
+                }
+            }
+        }
+        ContainmentBackend::MicroVm => {
+            // NanVix runtime files: nanvixd binary, rootfs image, initrd, and kernel ELF.
+            // The WHP snapshot (snapshots/kernel.vmem) is auto-generated on first boot
+            // and shared with Hyperlight, so it's not counted here.
+            let file_list = vec![
+                exe_dir.join("nanvixd.exe"),
+                exe_dir.join("nanvix_rootfs.img"),
+                exe_dir.join("python3.initrd"),
+                exe_dir.join("bin").join("kernel.elf"),
+            ];
+            let files: Vec<DiskFile> = file_list.iter().filter_map(|p| measure_file(p)).collect();
+            let total: f64 = files.iter().map(|f| f.actual_mb).sum();
+            eprintln!("  [NanVix] disk: {total:.1} MB");
+            for f in &files {
+                eprintln!("    {} — {:.1} MB", f.name, f.actual_mb);
+            }
+            DiskResult { backend: name.to_string(), total_mb: total, files, note: None }
+        }
+        ContainmentBackend::Wslc => {
+            // WSLc OCI images are stored inside a shared WSL2 ext4.vhdx — not
+            // attributable to a single container image from the host side.
+            eprintln!("  [WSLc] disk: OCI images inside shared WSL2 VHDX, not measurable per-image");
+            DiskResult {
+                backend: name.to_string(), total_mb: 0.0, files: vec![],
+                note: Some("OCI images stored inside shared WSL2 ext4.vhdx — per-image size not measurable from host".into()),
+            }
+        }
+        _ => DiskResult { backend: name.to_string(), total_mb: 0.0, files: vec![], note: None },
+    }
+}
 
-    let mut files = Vec::new();
-    let mut total = 0.0;
-
-    for path in &file_list {
-        if path.exists() {
-            let logical = path.metadata().map(|m| m.len() as f64 / (1024.0 * 1024.0)).unwrap_or(0.0);
-            #[cfg(target_os = "windows")]
-            let actual = file_actual_size_mb(path);
-            #[cfg(not(target_os = "windows"))]
-            let actual = logical;
-            total += actual;
-            files.push(DiskFile {
-                name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
-                logical_mb: logical,
-                actual_mb: actual,
-            });
+/// Resolve %LOCALAPPDATA% on Windows, fall back to $HOME/AppData/Local.
+fn resolve_localappdata() -> std::path::PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(v) = std::env::var_os("LOCALAPPDATA") {
+            return std::path::PathBuf::from(v);
         }
     }
-
-    DiskResult { backend: name.to_string(), total_mb: total, files }
+    // Fallback
+    if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+        return std::path::PathBuf::from(home).join("AppData").join("Local");
+    }
+    std::path::PathBuf::from(".")
 }
 
 // ---------------------------------------------------------------------------
@@ -1295,17 +1395,22 @@ fn measure_disk(backend: &ContainmentBackend) -> DiskResult {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize)]
-struct FullResult {
+struct WorkloadResult {
+    workload: String,
     warm_start: Vec<BackendResult>,
     cold_start: Vec<ColdStartResult>,
     density: Vec<DensityResult>,
-    disk: Vec<DiskResult>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FullResult {
+    workloads: Vec<WorkloadResult>,
+    disk: Vec<DiskResult>,  // workload-independent
 }
 
 fn generate_full_html(result: &FullResult) -> String {
     let json_data = serde_json::to_string(&result).unwrap_or_default();
 
-    // Build the scorecard rows from data
     format!(
         r##"<!DOCTYPE html>
 <html lang="en">
@@ -1317,23 +1422,27 @@ fn generate_full_html(result: &FullResult) -> String {
     --bg: #fafafa; --fg: #1a1a2e; --card-bg: #fff; --border: #e0e0e0;
     --accent1: #2563eb; --accent2: #dc2626; --accent3: #059669;
     --grid: #f0f0f0; --muted: #666; --header-bg: #f5f5f5;
+    --tab-active: #2563eb; --tab-inactive: transparent;
   }}
   @media (prefers-color-scheme: dark) {{
     :root {{
       --bg: #0d1117; --fg: #e6edf3; --card-bg: #161b22; --border: #30363d;
       --accent1: #58a6ff; --accent2: #f85149; --accent3: #3fb950;
       --grid: #21262d; --muted: #8b949e; --header-bg: #1c2128;
+      --tab-active: #58a6ff;
     }}
   }}
   :root[data-theme="dark"] {{
     --bg: #0d1117; --fg: #e6edf3; --card-bg: #161b22; --border: #30363d;
     --accent1: #58a6ff; --accent2: #f85149; --accent3: #3fb950;
     --grid: #21262d; --muted: #8b949e; --header-bg: #1c2128;
+    --tab-active: #58a6ff;
   }}
   :root[data-theme="light"] {{
     --bg: #fafafa; --fg: #1a1a2e; --card-bg: #fff; --border: #e0e0e0;
     --accent1: #2563eb; --accent2: #dc2626; --accent3: #059669;
     --grid: #f0f0f0; --muted: #666; --header-bg: #f5f5f5;
+    --tab-active: #2563eb;
   }}
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{
@@ -1357,13 +1466,26 @@ fn generate_full_html(result: &FullResult) -> String {
   th:first-child, td:first-child {{ text-align: left; }}
   tr:last-child td {{ border-bottom: none; }}
 
-  .note {{ color: var(--muted); font-size: 0.8rem; margin-top: -1rem; margin-bottom: 1.5rem; }}
+  .note {{ color: var(--muted); font-size: 0.8rem; margin-top: -1rem; margin-bottom: 1.5rem; font-style: italic; }}
   canvas {{ width: 100% !important; }}
   .chart-box {{
     background: var(--card-bg); border: 1px solid var(--border);
     border-radius: 6px; padding: 1.25rem; margin-bottom: 1.5rem;
   }}
-  .chart-title {{ font-size: 0.9rem; font-weight: 600; margin-bottom: 0.75rem; }}
+
+  .tabs {{
+    display: flex; gap: 0; border-bottom: 2px solid var(--border);
+    margin-bottom: 1.5rem; margin-top: 1rem;
+  }}
+  .tab {{
+    padding: 0.5rem 1.25rem; cursor: pointer; font-size: 0.85rem;
+    font-weight: 500; color: var(--muted); border-bottom: 2px solid transparent;
+    margin-bottom: -2px; transition: all 0.15s;
+  }}
+  .tab:hover {{ color: var(--fg); }}
+  .tab.active {{ color: var(--fg); border-bottom-color: var(--tab-active); }}
+  .tab-panel {{ display: none; }}
+  .tab-panel.active {{ display: block; }}
 </style>
 </head>
 <body>
@@ -1397,64 +1519,7 @@ function fmt(v, unit) {{
   return v.toFixed(1) + (unit || '');
 }}
 
-// --- Summary table ---
-const backends = D.warm_start.filter(w => !w.error).map(w => w.backend);
-const rows = [];
-
-// Cold-start
-rows.push(['Cold-start median (ms)', ...backends.map(b => {{
-  const r = D.cold_start.find(c => c.backend === b);
-  return r && !r.error ? fmt(r.stats.median_ms) : '—';
-}})]);
-rows.push(['Cold-start p95 (ms)', ...backends.map(b => {{
-  const r = D.cold_start.find(c => c.backend === b);
-  return r && !r.error ? fmt(r.stats.p95_ms) : '—';
-}})]);
-
-// Warm-start
-rows.push(['Warm-start median (ms)', ...backends.map(b => {{
-  const r = D.warm_start.find(w => w.backend === b);
-  return r && !r.error ? fmt(r.stats.median_ms) : '—';
-}})]);
-rows.push(['Warm-start p95 (ms)', ...backends.map(b => {{
-  const r = D.warm_start.find(w => w.backend === b);
-  return r && !r.error ? fmt(r.stats.p95_ms) : '—';
-}})]);
-
-// Memory
-rows.push(['Per-process WS peak (MB)', ...backends.map(b => {{
-  const r = D.cold_start.find(c => c.backend === b);
-  if (!r || r.error) return '—';
-  const peak = Math.max(...r.entries.map(e => e.peak_ws_mb));
-  return fmt(peak);
-}})]);
-rows.push(['Density cost (MB/runner)', ...backends.map(b => {{
-  const r = D.density.find(d => d.backend === b);
-  return r ? fmt(r.density_cost_mb) : '—';
-}})]);
-rows.push(['Density: fits in 1.5 GB', ...backends.map(b => {{
-  const r = D.density.find(d => d.backend === b);
-  return r ? String(r.fits_in_1500mb) : '—';
-}})]);
-
-// Disk
-rows.push(['Disk footprint (MB)', ...backends.map(b => {{
-  const r = D.disk.find(d => d.backend === b);
-  return r && r.total_mb > 0 ? fmt(r.total_mb) : '—';
-}})]);
-
-const thead = h('thead', null, h('tr', null,
-  h('th', null, 'Metric'),
-  ...backends.map(b => h('th', null, b))
-));
-const tbody = h('tbody', null,
-  ...rows.map(r => h('tr', null, ...r.map((cell, i) => h(i === 0 ? 'td' : 'td', null, cell))))
-);
-app.appendChild(h('h2', null, 'Summary'));
-app.appendChild(h('table', null, thead, tbody));
-
-// --- Latency charts ---
-function drawLatencyChart(canvas, datasets, title) {{
+function drawLatencyChart(canvas, datasets) {{
   const ctx = canvas.getContext('2d');
   const dpr = window.devicePixelRatio || 1;
   const rect = canvas.getBoundingClientRect();
@@ -1463,17 +1528,13 @@ function drawLatencyChart(canvas, datasets, title) {{
   const W = rect.width, H = rect.height;
   const pad = {{ top: 24, right: 20, bottom: 32, left: 56 }};
   const pW = W - pad.left - pad.right, pH = H - pad.top - pad.bottom;
-
   const allT = datasets.flatMap(d => d.values);
   if (!allT.length) return;
   const yMax = Math.max(...allT) * 1.15;
   const maxN = Math.max(...datasets.map(d => d.values.length));
-
   const cs = getComputedStyle(document.documentElement);
   const fg = cs.getPropertyValue('--fg').trim() || '#333';
   const grid = cs.getPropertyValue('--grid').trim() || '#eee';
-
-  // Y grid
   ctx.strokeStyle = grid; ctx.lineWidth = 0.5;
   for (let i = 0; i <= 4; i++) {{
     const y = pad.top + pH - (i / 4) * pH;
@@ -1483,7 +1544,6 @@ function drawLatencyChart(canvas, datasets, title) {{
   }}
   ctx.fillStyle = fg; ctx.font = '10px sans-serif'; ctx.textAlign = 'center';
   ctx.fillText('Iteration', pad.left + pW / 2, H - 4);
-
   datasets.forEach((ds, di) => {{
     const color = COLORS[di % COLORS.length];
     ctx.strokeStyle = color; ctx.lineWidth = 1.5;
@@ -1500,7 +1560,6 @@ function drawLatencyChart(canvas, datasets, title) {{
       const y = pad.top + pH - (v / yMax) * pH;
       ctx.beginPath(); ctx.arc(x, y, 2.5, 0, Math.PI * 2); ctx.fill();
     }});
-    // Legend
     const lx = pad.left + 8 + di * 140, ly = pad.top + 12;
     ctx.fillStyle = color; ctx.fillRect(lx, ly - 6, 10, 10);
     ctx.fillStyle = fg; ctx.textAlign = 'left'; ctx.font = '11px sans-serif';
@@ -1508,68 +1567,183 @@ function drawLatencyChart(canvas, datasets, title) {{
   }});
 }}
 
-// Warm-start chart
-const warmDs = D.warm_start.filter(w => !w.error).map(w => ({{
-  label: w.backend, values: w.iterations.map(it => it.elapsed_ms)
-}}));
-if (warmDs.length) {{
-  app.appendChild(h('h2', null, 'Warm-start latency'));
-  const box = h('div', {{className: 'chart-box'}});
-  const cv = h('canvas', {{height: '220'}});
-  box.appendChild(cv); app.appendChild(box);
-  setTimeout(() => drawLatencyChart(cv, warmDs, 'Warm-start'), 0);
-  window.addEventListener('resize', () => drawLatencyChart(cv, warmDs, 'Warm-start'));
+// --- Build per-workload tabs ---
+const multiWorkload = D.workloads.length > 1;
+const allCanvases = [];
+
+if (multiWorkload) {{
+  const tabBar = h('div', {{className: 'tabs'}});
+  D.workloads.forEach((wl, wi) => {{
+    const tab = h('div', {{className: 'tab' + (wi === 0 ? ' active' : '')}}, wl.workload);
+    tab.onclick = () => {{
+      tabBar.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      tab.classList.add('active');
+      document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+      document.getElementById('wl-' + wi).classList.add('active');
+      // redraw canvases in the newly visible panel
+      allCanvases.filter(c => c.panel === wi).forEach(c => c.draw());
+    }};
+    tabBar.appendChild(tab);
+  }});
+  app.appendChild(tabBar);
 }}
 
-// Cold-start chart
-const coldDs = D.cold_start.filter(c => !c.error).map(c => ({{
-  label: c.backend, values: c.entries.map(e => e.elapsed_ms)
-}}));
-if (coldDs.length) {{
-  app.appendChild(h('h2', null, 'Cold-start latency'));
-  const box = h('div', {{className: 'chart-box'}});
-  const cv = h('canvas', {{height: '220'}});
-  box.appendChild(cv); app.appendChild(box);
-  setTimeout(() => drawLatencyChart(cv, coldDs, 'Cold-start'), 0);
-  window.addEventListener('resize', () => drawLatencyChart(cv, coldDs, 'Cold-start'));
-}}
+D.workloads.forEach((wl, wi) => {{
+  const panel = h('div', {{
+    className: 'tab-panel' + (wi === 0 || !multiWorkload ? ' active' : ''),
+    id: 'wl-' + wi
+  }});
 
-// --- Detailed tables ---
-app.appendChild(h('h2', null, 'Warm-start detail'));
-const wHead = h('thead', null, h('tr', null, ...['Backend','Median','Mean','Min','Max','P95','Stdev','Setup'].map(t => h('th', null, t))));
-const wBody = h('tbody', null, ...D.warm_start.map(w => {{
-  if (w.error) return h('tr', null, h('td', null, w.backend), h('td', {{colspan:'7'}}, w.error));
-  const s = w.stats;
-  return h('tr', null, h('td',null,w.backend), ...[s.median_ms,s.mean_ms,s.min_ms,s.max_ms,s.p95_ms,s.stdev_ms].map(v=>h('td',null,fmt(v))), h('td',null,fmt(w.runner_create_ms||0)+'ms'));
-}}));
-app.appendChild(h('table', null, wHead, wBody));
+  const backends = wl.warm_start.filter(w => !w.error).map(w => w.backend);
+  const rows = [];
 
-app.appendChild(h('h2', null, 'Cold-start detail'));
-const cHead = h('thead', null, h('tr', null, ...['Backend','Median','Mean','Min','Max','P95','Stdev','Peak WS'].map(t => h('th', null, t))));
-const cBody = h('tbody', null, ...D.cold_start.map(c => {{
-  if (c.error) return h('tr', null, h('td', null, c.backend), h('td', {{colspan:'7'}}, c.error));
-  const s = c.stats; const peakWs = Math.max(...c.entries.map(e => e.peak_ws_mb));
-  return h('tr', null, h('td',null,c.backend), ...[s.median_ms,s.mean_ms,s.min_ms,s.max_ms,s.p95_ms,s.stdev_ms].map(v=>h('td',null,fmt(v))), h('td',null,fmt(peakWs)+' MB'));
-}}));
-app.appendChild(h('table', null, cHead, cBody));
+  // Summary table
+  rows.push(['Cold-start median (ms)', ...backends.map(b => {{
+    const r = wl.cold_start.find(c => c.backend === b);
+    return r && !r.error ? fmt(r.stats.median_ms) : '—';
+  }})]);
+  rows.push(['Cold-start p95 (ms)', ...backends.map(b => {{
+    const r = wl.cold_start.find(c => c.backend === b);
+    return r && !r.error ? fmt(r.stats.p95_ms) : '—';
+  }})]);
+  rows.push(['Warm-start median (ms)', ...backends.map(b => {{
+    const r = wl.warm_start.find(w => w.backend === b);
+    return r && !r.error ? fmt(r.stats.median_ms) : '—';
+  }})]);
+  rows.push(['Warm-start p95 (ms)', ...backends.map(b => {{
+    const r = wl.warm_start.find(w => w.backend === b);
+    return r && !r.error ? fmt(r.stats.p95_ms) : '—';
+  }})]);
+  rows.push(['Per-process WS peak (MB)', ...backends.map(b => {{
+    const r = wl.cold_start.find(c => c.backend === b);
+    if (!r || r.error) return '—';
+    return fmt(Math.max(...r.entries.map(e => e.peak_ws_mb)));
+  }})]);
+  rows.push(['Density cost (MB/runner)', ...backends.map(b => {{
+    const r = wl.density.find(d => d.backend === b);
+    if (!r) return '—';
+    return r.note ? fmt(r.density_cost_mb) + ' *' : fmt(r.density_cost_mb);
+  }})]);
+  rows.push(['Density: fits in 1.5 GB', ...backends.map(b => {{
+    const r = wl.density.find(d => d.backend === b);
+    if (!r) return '—';
+    return r.note ? String(r.fits_in_1500mb) + ' *' : String(r.fits_in_1500mb);
+  }})]);
 
-app.appendChild(h('h2', null, 'Density'));
-const dHead = h('thead', null, h('tr', null, ...['Backend','Model','Cost (MB)','Persistent','Peak exec','Daemon','Fits 1.5GB'].map(t => h('th', null, t))));
-const dBody = h('tbody', null, ...D.density.map(d => {{
-  const model = d.ephemeral ? 'ephemeral' : 'persistent';
-  const daemon = d.per_runner_daemon_mb != null ? fmt(d.per_runner_daemon_mb) : '—';
-  return h('tr', null, h('td',null,d.backend), h('td',null,model),
-    h('td',null,fmt(d.density_cost_mb)), h('td',null,fmt(d.per_runner_persistent_mb)),
-    h('td',null,fmt(d.per_exec_peak_mb)), h('td',null,daemon), h('td',null,String(d.fits_in_1500mb)));
-}}));
-app.appendChild(h('table', null, dHead, dBody));
+  // Disk (from top-level, workload-independent)
+  rows.push(['Disk footprint (MB)', ...backends.map(b => {{
+    const r = D.disk.find(d => d.backend === b);
+    if (!r) return '—';
+    if (r.total_mb > 0) return fmt(r.total_mb);
+    return r.note ? 'N/A *' : '—';
+  }})]);
 
-if (D.disk.some(d => d.files.length)) {{
+  const thead = h('thead', null, h('tr', null,
+    h('th', null, 'Metric'), ...backends.map(b => h('th', null, b))));
+  const tbody = h('tbody', null,
+    ...rows.map(r => h('tr', null, ...r.map((cell, i) => h(i === 0 ? 'td' : 'td', null, cell)))));
+  panel.appendChild(h('h2', null, multiWorkload ? 'Summary — ' + wl.workload : 'Summary'));
+  panel.appendChild(h('table', null, thead, tbody));
+
+  // Footnotes for density/disk notes
+  const notes = [];
+  wl.density.filter(d => d.note).forEach(d => notes.push(d.backend + ' density: ' + d.note));
+  D.disk.filter(d => d.note).forEach(d => notes.push(d.backend + ' disk: ' + d.note));
+  if (notes.length) {{
+    panel.appendChild(h('p', {{className: 'note'}}, '* ' + notes.join('. ')));
+  }}
+
+  // Warm-start chart
+  const warmDs = wl.warm_start.filter(w => !w.error).map(w => ({{
+    label: w.backend, values: w.iterations.map(it => it.elapsed_ms)
+  }}));
+  if (warmDs.length) {{
+    panel.appendChild(h('h2', null, 'Warm-start latency'));
+    const box = h('div', {{className: 'chart-box'}});
+    const cv = h('canvas', {{height: '220'}});
+    box.appendChild(cv); panel.appendChild(box);
+    const draw = () => drawLatencyChart(cv, warmDs);
+    allCanvases.push({{ panel: wi, draw }});
+    setTimeout(draw, 0);
+    window.addEventListener('resize', draw);
+  }}
+
+  // Cold-start chart
+  const coldDs = wl.cold_start.filter(c => !c.error).map(c => ({{
+    label: c.backend, values: c.entries.map(e => e.elapsed_ms)
+  }}));
+  if (coldDs.length) {{
+    panel.appendChild(h('h2', null, 'Cold-start latency'));
+    const box = h('div', {{className: 'chart-box'}});
+    const cv = h('canvas', {{height: '220'}});
+    box.appendChild(cv); panel.appendChild(box);
+    const draw = () => drawLatencyChart(cv, coldDs);
+    allCanvases.push({{ panel: wi, draw }});
+    setTimeout(draw, 0);
+    window.addEventListener('resize', draw);
+  }}
+
+  // Warm-start detail
+  panel.appendChild(h('h2', null, 'Warm-start detail'));
+  const wHead = h('thead', null, h('tr', null,
+    ...['Backend','Median','Mean','Min','Max','P95','Stdev','Setup'].map(t => h('th', null, t))));
+  const wBody = h('tbody', null, ...wl.warm_start.map(w => {{
+    if (w.error) return h('tr', null, h('td', null, w.backend), h('td', {{colspan:'7'}}, w.error));
+    const s = w.stats;
+    return h('tr', null, h('td',null,w.backend),
+      ...[s.median_ms,s.mean_ms,s.min_ms,s.max_ms,s.p95_ms,s.stdev_ms].map(v=>h('td',null,fmt(v))),
+      h('td',null,fmt(w.runner_create_ms||0)+'ms'));
+  }}));
+  panel.appendChild(h('table', null, wHead, wBody));
+
+  // Cold-start detail
+  panel.appendChild(h('h2', null, 'Cold-start detail'));
+  const cHead = h('thead', null, h('tr', null,
+    ...['Backend','Median','Mean','Min','Max','P95','Stdev','Peak WS'].map(t => h('th', null, t))));
+  const cBody = h('tbody', null, ...wl.cold_start.map(c => {{
+    if (c.error) return h('tr', null, h('td', null, c.backend), h('td', {{colspan:'7'}}, c.error));
+    const s = c.stats; const peakWs = Math.max(...c.entries.map(e => e.peak_ws_mb));
+    return h('tr', null, h('td',null,c.backend),
+      ...[s.median_ms,s.mean_ms,s.min_ms,s.max_ms,s.p95_ms,s.stdev_ms].map(v=>h('td',null,fmt(v))),
+      h('td',null,fmt(peakWs)+' MB'));
+  }}));
+  panel.appendChild(h('table', null, cHead, cBody));
+
+  // Density detail
+  panel.appendChild(h('h2', null, 'Density'));
+  const dHead = h('thead', null, h('tr', null,
+    ...['Backend','Model','Cost (MB)','Persistent','Peak exec','Daemon','Fits 1.5GB'].map(t => h('th', null, t))));
+  const dBody = h('tbody', null, ...wl.density.map(d => {{
+    const model = d.ephemeral ? 'ephemeral' : 'persistent';
+    const daemon = d.per_runner_daemon_mb != null ? fmt(d.per_runner_daemon_mb) : '—';
+    return h('tr', null, h('td',null,d.backend), h('td',null,model),
+      h('td',null,fmt(d.density_cost_mb)), h('td',null,fmt(d.per_runner_persistent_mb)),
+      h('td',null,fmt(d.per_exec_peak_mb)), h('td',null,daemon), h('td',null,String(d.fits_in_1500mb)));
+  }}));
+  panel.appendChild(h('table', null, dHead, dBody));
+
+  app.appendChild(panel);
+}});
+
+// --- Disk footprint (workload-independent, shown once outside tabs) ---
+if (D.disk.some(d => d.files.length || d.note)) {{
   app.appendChild(h('h2', null, 'Disk footprint'));
-  const fHead = h('thead', null, h('tr', null, ...['Backend','Total (MB)','Files'].map(t => h('th', null, t))));
-  const fBody = h('tbody', null, ...D.disk.filter(d => d.files.length).map(d => {{
-    const files = d.files.map(f => `${{f.name}} (${{fmt(f.actual_mb)}} MB)`).join(', ');
-    return h('tr', null, h('td',null,d.backend), h('td',null,fmt(d.total_mb)), h('td',{{style:{{textAlign:'left'}}}},files));
+  const fHead = h('thead', null, h('tr', null,
+    ...['Backend','On-disk (MB)','Logical (MB)','Files / Notes'].map(t => h('th', null, t))));
+  const fBody = h('tbody', null, ...D.disk.map(d => {{
+    if (d.files.length) {{
+      const files = d.files.map(f => {{
+        if (Math.abs(f.actual_mb - f.logical_mb) > 0.5)
+          return f.name + ' (' + fmt(f.actual_mb) + ' on-disk, ' + fmt(f.logical_mb) + ' logical)';
+        return f.name + ' (' + fmt(f.actual_mb) + ' MB)';
+      }}).join(', ');
+      const logical = d.files.reduce((s, f) => s + f.logical_mb, 0);
+      return h('tr', null, h('td',null,d.backend), h('td',null,fmt(d.total_mb)),
+        h('td',null,fmt(logical)), h('td',{{style:{{textAlign:'left'}}}},files));
+    }} else {{
+      return h('tr', null, h('td',null,d.backend), h('td',null,'N/A'), h('td',null,'N/A'),
+        h('td',{{style:{{textAlign:'left',fontStyle:'italic',color:'var(--muted)'}}}}, d.note || 'No files found'));
+    }}
   }}));
   app.appendChild(h('table', null, fHead, fBody));
 }}
@@ -1602,28 +1776,47 @@ fn main() {
     // Full benchmark mode: one command → one HTML
     if cli.full {
         let output_path = cli.output_html.as_deref().unwrap_or("bench_report.html");
+        let workloads: Vec<String> = cli.workloads.clone()
+            .unwrap_or_else(|| vec![cli.workload.clone()]);
 
-        eprintln!("Running full benchmark: warm-start, cold-start, density, disk\n");
+        eprintln!("Running full benchmark: warm-start, cold-start, density, disk");
+        eprintln!("Workloads: {}\n", workloads.join(", "));
 
-        // 1. Warm-start
-        let warm_start: Vec<BackendResult> = backends
-            .iter()
-            .map(|b| benchmark_backend(b, cli.warmup, cli.iterations, &cli.wslc_image, None, &cli.workload))
-            .collect();
+        let mut workload_results = Vec::new();
 
-        // 2. Cold-start
-        let cold_start: Vec<ColdStartResult> = backends
-            .iter()
-            .map(|b| cold_start_benchmark(b, cli.warmup, cli.iterations, &cli.wslc_image, &cli.workload))
-            .collect();
+        for wl in &workloads {
+            eprintln!("\n{}", "=".repeat(60));
+            eprintln!("  WORKLOAD: {wl}");
+            eprintln!("{}", "=".repeat(60));
 
-        // 3. Density
-        let density = density_test(cli.density_count, &backends, &cli.wslc_image, &cli.workload);
+            // 1. Warm-start
+            let warm_start: Vec<BackendResult> = backends
+                .iter()
+                .map(|b| benchmark_backend(b, cli.warmup, cli.iterations, &cli.wslc_image, None, wl))
+                .collect();
 
-        // 4. Disk
+            // 2. Cold-start
+            let cold_start: Vec<ColdStartResult> = backends
+                .iter()
+                .map(|b| cold_start_benchmark(b, cli.warmup, cli.iterations, &cli.wslc_image, wl))
+                .collect();
+
+            // 3. Density (only run once per workload — memory model is workload-independent
+            // but we include it per-workload so the report shows exec times)
+            let density = density_test(cli.density_count, &backends, &cli.wslc_image, wl);
+
+            workload_results.push(WorkloadResult {
+                workload: wl.clone(),
+                warm_start,
+                cold_start,
+                density,
+            });
+        }
+
+        // 4. Disk (workload-independent, run once)
         let disk: Vec<DiskResult> = backends.iter().map(|b| measure_disk(b)).collect();
 
-        let result = FullResult { warm_start, cold_start, density, disk };
+        let result = FullResult { workloads: workload_results, disk };
 
         // Write JSON
         if let Some(path) = &cli.output_json {
@@ -1641,17 +1834,28 @@ fn main() {
         eprintln!("\n{}", "=".repeat(60));
         eprintln!("  FULL BENCHMARK SUMMARY");
         eprintln!("{}", "=".repeat(60));
+        for wl_result in &result.workloads {
+            eprintln!("\n  Workload: {}", wl_result.workload);
+            for b in &backends {
+                let name = backend_display_name(b);
+                let warm = wl_result.warm_start.iter().find(|r| r.backend == name);
+                let cold = wl_result.cold_start.iter().find(|r| r.backend == name);
+                let dens = wl_result.density.iter().find(|r| r.backend == name);
+                eprintln!("  {name}:");
+                if let Some(w) = warm { if w.error.is_none() { eprintln!("    warm-start: {:.1}ms median", w.stats.median_ms); } }
+                if let Some(c) = cold { if c.error.is_none() { eprintln!("    cold-start: {:.1}ms median  peakWS={:.1}MB", c.stats.median_ms, c.entries.iter().map(|e| e.peak_ws_mb).fold(0.0f64, f64::max)); } }
+                if let Some(d) = dens { eprintln!("    density:    {:.1}MB/runner  ~{} fit in 1.5GB", d.density_cost_mb, d.fits_in_1500mb); }
+            }
+        }
         for b in &backends {
             let name = backend_display_name(b);
-            let warm = result.warm_start.iter().find(|r| r.backend == name);
-            let cold = result.cold_start.iter().find(|r| r.backend == name);
-            let dens = result.density.iter().find(|r| r.backend == name);
-            let dsk = result.disk.iter().find(|r| r.backend == name);
-            eprintln!("  {name}:");
-            if let Some(w) = warm { if w.error.is_none() { eprintln!("    warm-start: {:.1}ms median", w.stats.median_ms); } }
-            if let Some(c) = cold { if c.error.is_none() { eprintln!("    cold-start: {:.1}ms median  peakWS={:.1}MB", c.stats.median_ms, c.entries.iter().map(|e| e.peak_ws_mb).fold(0.0f64, f64::max)); } }
-            if let Some(d) = dens { eprintln!("    density:    {:.1}MB/runner  ~{} fit in 1.5GB", d.density_cost_mb, d.fits_in_1500mb); }
-            if let Some(d) = dsk { if d.total_mb > 0.0 { eprintln!("    disk:       {:.1}MB", d.total_mb); } }
+            if let Some(d) = result.disk.iter().find(|r| r.backend == name) {
+                if d.total_mb > 0.0 {
+                    eprintln!("  {name}: disk={:.1}MB", d.total_mb);
+                } else if let Some(note) = &d.note {
+                    eprintln!("  {name}: disk=N/A ({note})");
+                }
+            }
         }
 
         return;
