@@ -430,7 +430,12 @@ fn make_request(
     // Hyperlight & NanVix interpret script_code as inline Python source.
     // WSLc interprets it as a shell command line.
     let script_code = match backend {
-        ContainmentBackend::Wslc => format!("python3 -c \"{}\"", py_src.replace('\n', "; ")),
+        ContainmentBackend::Wslc => {
+            // Multi-line Python scripts can't use `python3 -c "..."` with semicolons
+            // (for/if blocks don't work). Use exec() with escaped newlines instead.
+            let escaped = py_src.replace('\\', "\\\\").replace('\'', "\\'");
+            format!("python3 -c \"exec('{}')\"", escaped.replace('\n', "\\n"))
+        }
         _ => py_src.to_string(),
     };
 
