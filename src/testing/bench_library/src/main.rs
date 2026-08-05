@@ -381,22 +381,23 @@ fn compute_stats(times: &[f64]) -> Stats {
 /// Python source for the "hello" workload (trivial, <1ms guest time).
 const HELLO_PY: &str = "import sys, time; t0=time.time(); print(f'Hello from library bench! Python {sys.version}'); print(f'ELAPSED_GUEST_MS={int((time.time()-t0)*1000)}')";
 
-/// Python source for the "compute" workload — JSON serialization benchmark.
-/// Uses json (stdlib, pre-warmed in Hyperlight's snapshot) to build, serialize,
-/// and parse a 10k-record dataset 10 times. Shows pre-warming advantage (json is
-/// pre-loaded in HL snapshot, cold-imported ~48ms on NanVix) plus CPU compute.
+/// Python source for the "compute" workload — jinja2 template rendering.
+/// Jinja2 is pre-warmed in Hyperlight's snapshot (import=0ms) but must be
+/// cold-imported on NanVix (~68ms). Not available on WSLc (stdlib only).
 const COMPUTE_PY: &str = r#"import time
 t0 = time.time()
-import json
+from jinja2 import Template
 t_import = (time.time() - t0) * 1000
+tmpl = Template('<html><body><h1>{{ title }}</h1><table>{% for row in data %}<tr><td>{{ row.name }}</td><td>{{ row.value }}</td><td>{{ row.status }}</td></tr>{% endfor %}</table><p>Total: {{ count }} rows, sum={{ total }}</p></body></html>')
 data = []
 for i in range(10000):
-    data.append({'id': i, 'name': 'item_' + str(i), 'value': round((i * 17 % 997) / 10.0, 2), 'tags': ['tag_' + str(i % 10), 'cat_' + str(i % 5)], 'active': i % 3 != 0})
-for _ in range(10):
-    s = json.dumps(data)
-    parsed = json.loads(s)
+    v = round((i * 17 % 997) / 10.0, 2)
+    s = 'active' if i % 3 else 'inactive'
+    data.append({'name': 'item_' + str(i), 'value': v, 'status': s})
+total = round(sum(d['value'] for d in data), 2)
+output = tmpl.render(title='Benchmark Report', data=data, count=len(data), total=total)
 elapsed_ms = (time.time() - t0) * 1000
-print(f'json: {len(data)} records, {len(s)} chars, 10 rounds, import={t_import:.0f}ms, total={elapsed_ms:.0f}ms')
+print(f'jinja2: {len(data)} rows, {len(output)} chars, import={t_import:.0f}ms, total={elapsed_ms:.0f}ms')
 print(f'ELAPSED_GUEST_MS={int(elapsed_ms)}')"#;
 
 fn workload_py_src(name: &str) -> &'static str {
