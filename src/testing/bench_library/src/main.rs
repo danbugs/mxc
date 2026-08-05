@@ -1572,6 +1572,64 @@ function drawLatencyChart(canvas, datasets) {{
   }});
 }}
 
+// --- Front-page summary (all workloads at a glance) ---
+{{
+  const allBackends = [...new Set(D.workloads.flatMap(wl =>
+    wl.warm_start.filter(w => !w.error).map(w => w.backend)))];
+
+  const sRows = [];
+  D.workloads.forEach(wl => {{
+    sRows.push([wl.workload + ' warm-start (ms)', ...allBackends.map(b => {{
+      const r = wl.warm_start.find(w => w.backend === b);
+      return r && !r.error ? fmt(r.stats.median_ms) : '—';
+    }})]);
+    sRows.push([wl.workload + ' cold-start (ms)', ...allBackends.map(b => {{
+      const r = wl.cold_start.find(c => c.backend === b);
+      return r && !r.error ? fmt(r.stats.median_ms) : '—';
+    }})]);
+  }});
+
+  // Density (same across workloads, take from first)
+  if (D.workloads.length) {{
+    const wl0 = D.workloads[0];
+    sRows.push(['Density (MB/runner)', ...allBackends.map(b => {{
+      const r = wl0.density.find(d => d.backend === b);
+      if (!r) return '—';
+      return r.note ? fmt(r.density_cost_mb) + ' *' : fmt(r.density_cost_mb);
+    }})]);
+    sRows.push(['Fits in 1.5 GB', ...allBackends.map(b => {{
+      const r = wl0.density.find(d => d.backend === b);
+      if (!r) return '—';
+      return r.note ? String(r.fits_in_1500mb) + ' *' : String(r.fits_in_1500mb);
+    }})]);
+  }}
+
+  // Disk
+  sRows.push(['Disk footprint (MB)', ...allBackends.map(b => {{
+    const r = D.disk.find(d => d.backend === b);
+    if (!r) return '—';
+    if (r.total_mb > 0) return fmt(r.total_mb);
+    return r.note ? 'N/A *' : '—';
+  }})]);
+
+  const sHead = h('thead', null, h('tr', null,
+    h('th', null, 'Metric'), ...allBackends.map(b => h('th', null, b))));
+  const sBody = h('tbody', null,
+    ...sRows.map(r => h('tr', null, ...r.map((cell, i) => h(i === 0 ? 'td' : 'td', null, cell)))));
+  app.appendChild(h('h2', null, 'Summary'));
+  app.appendChild(h('table', null, sHead, sBody));
+
+  // Footnotes
+  const sNotes = [];
+  if (D.workloads.length) {{
+    D.workloads[0].density.filter(d => d.note).forEach(d => sNotes.push(d.backend + ': ' + d.note));
+  }}
+  D.disk.filter(d => d.note).forEach(d => sNotes.push(d.backend + ' disk: ' + d.note));
+  if (sNotes.length) {{
+    app.appendChild(h('p', {{className: 'note'}}, '* ' + sNotes.join('. ')));
+  }}
+}}
+
 // --- Build per-workload tabs ---
 const multiWorkload = D.workloads.length > 1;
 const allCanvases = [];
@@ -1585,8 +1643,10 @@ if (multiWorkload) {{
       tab.classList.add('active');
       document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
       document.getElementById('wl-' + wi).classList.add('active');
-      // redraw canvases in the newly visible panel
-      allCanvases.filter(c => c.panel === wi).forEach(c => c.draw());
+      // redraw canvases in the newly visible panel (rAF waits for layout)
+      requestAnimationFrame(() => {{
+        allCanvases.filter(c => c.panel === wi).forEach(c => c.draw());
+      }});
     }};
     tabBar.appendChild(tab);
   }});
@@ -1600,63 +1660,6 @@ D.workloads.forEach((wl, wi) => {{
   }});
 
   const backends = wl.warm_start.filter(w => !w.error).map(w => w.backend);
-  const rows = [];
-
-  // Summary table
-  rows.push(['Cold-start median (ms)', ...backends.map(b => {{
-    const r = wl.cold_start.find(c => c.backend === b);
-    return r && !r.error ? fmt(r.stats.median_ms) : '—';
-  }})]);
-  rows.push(['Cold-start p95 (ms)', ...backends.map(b => {{
-    const r = wl.cold_start.find(c => c.backend === b);
-    return r && !r.error ? fmt(r.stats.p95_ms) : '—';
-  }})]);
-  rows.push(['Warm-start median (ms)', ...backends.map(b => {{
-    const r = wl.warm_start.find(w => w.backend === b);
-    return r && !r.error ? fmt(r.stats.median_ms) : '—';
-  }})]);
-  rows.push(['Warm-start p95 (ms)', ...backends.map(b => {{
-    const r = wl.warm_start.find(w => w.backend === b);
-    return r && !r.error ? fmt(r.stats.p95_ms) : '—';
-  }})]);
-  rows.push(['Per-process WS peak (MB)', ...backends.map(b => {{
-    const r = wl.cold_start.find(c => c.backend === b);
-    if (!r || r.error) return '—';
-    return fmt(Math.max(...r.entries.map(e => e.peak_ws_mb)));
-  }})]);
-  rows.push(['Density cost (MB/runner)', ...backends.map(b => {{
-    const r = wl.density.find(d => d.backend === b);
-    if (!r) return '—';
-    return r.note ? fmt(r.density_cost_mb) + ' *' : fmt(r.density_cost_mb);
-  }})]);
-  rows.push(['Density: fits in 1.5 GB', ...backends.map(b => {{
-    const r = wl.density.find(d => d.backend === b);
-    if (!r) return '—';
-    return r.note ? String(r.fits_in_1500mb) + ' *' : String(r.fits_in_1500mb);
-  }})]);
-
-  // Disk (from top-level, workload-independent)
-  rows.push(['Disk footprint (MB)', ...backends.map(b => {{
-    const r = D.disk.find(d => d.backend === b);
-    if (!r) return '—';
-    if (r.total_mb > 0) return fmt(r.total_mb);
-    return r.note ? 'N/A *' : '—';
-  }})]);
-
-  const thead = h('thead', null, h('tr', null,
-    h('th', null, 'Metric'), ...backends.map(b => h('th', null, b))));
-  const tbody = h('tbody', null,
-    ...rows.map(r => h('tr', null, ...r.map((cell, i) => h(i === 0 ? 'td' : 'td', null, cell)))));
-  panel.appendChild(h('h2', null, multiWorkload ? 'Summary — ' + wl.workload : 'Summary'));
-  panel.appendChild(h('table', null, thead, tbody));
-
-  // Footnotes for density/disk notes
-  const notes = [];
-  wl.density.filter(d => d.note).forEach(d => notes.push(d.backend + ' density: ' + d.note));
-  D.disk.filter(d => d.note).forEach(d => notes.push(d.backend + ' disk: ' + d.note));
-  if (notes.length) {{
-    panel.appendChild(h('p', {{className: 'note'}}, '* ' + notes.join('. ')));
-  }}
 
   // Warm-start chart
   const warmDs = wl.warm_start.filter(w => !w.error).map(w => ({{
@@ -1717,13 +1720,10 @@ D.workloads.forEach((wl, wi) => {{
   // Density detail
   panel.appendChild(h('h2', null, 'Density'));
   const dHead = h('thead', null, h('tr', null,
-    ...['Backend','Model','Cost (MB)','Persistent','Peak exec','Daemon','Fits 1.5GB'].map(t => h('th', null, t))));
+    ...['Backend','Cost (MB/runner)','Fits in 1.5 GB'].map(t => h('th', null, t))));
   const dBody = h('tbody', null, ...wl.density.map(d => {{
-    const model = d.ephemeral ? 'ephemeral' : 'persistent';
-    const daemon = d.per_runner_daemon_mb != null ? fmt(d.per_runner_daemon_mb) : '—';
-    return h('tr', null, h('td',null,d.backend), h('td',null,model),
-      h('td',null,fmt(d.density_cost_mb)), h('td',null,fmt(d.per_runner_persistent_mb)),
-      h('td',null,fmt(d.per_exec_peak_mb)), h('td',null,daemon), h('td',null,String(d.fits_in_1500mb)));
+    return h('tr', null, h('td',null,d.backend),
+      h('td',null,fmt(d.density_cost_mb)), h('td',null,String(d.fits_in_1500mb)));
   }}));
   panel.appendChild(h('table', null, dHead, dBody));
 
@@ -1734,19 +1734,14 @@ D.workloads.forEach((wl, wi) => {{
 if (D.disk.some(d => d.files.length || d.note)) {{
   app.appendChild(h('h2', null, 'Disk footprint'));
   const fHead = h('thead', null, h('tr', null,
-    ...['Backend','On-disk (MB)','Logical (MB)','Files / Notes'].map(t => h('th', null, t))));
+    ...['Backend','On-disk (MB)','Files / Notes'].map(t => h('th', null, t))));
   const fBody = h('tbody', null, ...D.disk.map(d => {{
     if (d.files.length) {{
-      const files = d.files.map(f => {{
-        if (Math.abs(f.actual_mb - f.logical_mb) > 0.5)
-          return f.name + ' (' + fmt(f.actual_mb) + ' on-disk, ' + fmt(f.logical_mb) + ' logical)';
-        return f.name + ' (' + fmt(f.actual_mb) + ' MB)';
-      }}).join(', ');
-      const logical = d.files.reduce((s, f) => s + f.logical_mb, 0);
+      const files = d.files.map(f => f.name + ' (' + fmt(f.actual_mb) + ' MB)').join(', ');
       return h('tr', null, h('td',null,d.backend), h('td',null,fmt(d.total_mb)),
-        h('td',null,fmt(logical)), h('td',{{style:{{textAlign:'left'}}}},files));
+        h('td',{{style:{{textAlign:'left'}}}},files));
     }} else {{
-      return h('tr', null, h('td',null,d.backend), h('td',null,'N/A'), h('td',null,'N/A'),
+      return h('tr', null, h('td',null,d.backend), h('td',null,'N/A'),
         h('td',{{style:{{textAlign:'left',fontStyle:'italic',color:'var(--muted)'}}}}, d.note || 'No files found'));
     }}
   }}));
