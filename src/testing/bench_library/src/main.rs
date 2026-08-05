@@ -3,29 +3,28 @@
 
 //! Library-mode benchmark for MXC containment backends.
 //!
-//! Unlike the CLI benchmark (which spawns `wxc-exec` per iteration and pays
-//! process-creation + config-parse overhead every time), this binary creates
-//! the runner **once** and calls `execute()` in a loop, measuring the
-//! steady-state latency that an in-process caller (e.g. the mxc SDK) sees.
-//!
-//! Supports: Hyperlight, MicroVM (NanVix), WSLc.
+//! Measures steady-state per-invocation latency (runner reuse, no process
+//! overhead) and per-runner memory density. For daemon-backed backends
+//! (NanVix, WSLc) where VM/container memory is ephemeral or lives in external
+//! processes, we measure peak WS during execution to capture the true per-VM cost.
 //!
 //! Usage:
 //!   bench-library --backend hyperlight --iterations 20 --warmup 3
-//!   bench-library --backend microvm --iterations 20
-//!   bench-library --backend wslc --iterations 20 --wslc-image python:3.12-alpine
 //!   bench-library --all --iterations 10 --output-json results.json
 //!   bench-library --all --workload compute --iterations 10
-//!   bench-library --density 8 --backend hyperlight
+//!   bench-library --density 8 --all
 
 use std::fs;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use serde::Serialize;
 use wxc_common::config_parser::load_request;
 use wxc_common::logger::{Logger, Mode};
 use wxc_common::models::{ContainmentBackend, ExecutionRequest, ScriptResponse};
+use wxc_common::script_runner::ScriptRunner;
 
 #[derive(Parser)]
 #[command(
@@ -97,28 +96,65 @@ fn backend_display_name(b: &ContainmentBackend) -> &'static str {
     }
 }
 
+/// Returns the external daemon process names for a given backend.
+fn daemon_process_names(b: &ContainmentBackend) -> Vec<&'static str> {
+    match b {
+        ContainmentBackend::MicroVm => vec!["nanvixd"],
+        ContainmentBackend::Wslc => vec!["wslservice"],
+        _ => vec![],
+    }
+}
+
+/// Whether this backend's VM/container memory is ephemeral (freed after execute).
+fn is_ephemeral_backend(b: &ContainmentBackend) -> bool {
+    matches!(
+        b,
+        ContainmentBackend::MicroVm | ContainmentBackend::Wslc
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Process memory measurement (cross-platform, no external crates)
 // ---------------------------------------------------------------------------
 
-/// Returns the current process working set in MB.
 #[cfg(target_os = "windows")]
-fn process_working_set_mb() -> f64 {
+mod mem_win {
     use std::mem;
 
     #[repr(C)]
     #[allow(non_snake_case)]
-    struct ProcessMemoryCounters {
-        cb: u32,
-        PageFaultCount: u32,
-        PeakWorkingSetSize: usize,
-        WorkingSetSize: usize,
-        QuotaPeakPagedPoolUsage: usize,
-        QuotaPagedPoolUsage: usize,
-        QuotaPeakNonPagedPoolUsage: usize,
-        QuotaNonPagedPoolUsage: usize,
-        PagefileUsage: usize,
-        PeakPagefileUsage: usize,
+    pub struct ProcessMemoryCounters {
+        pub cb: u32,
+        pub PageFaultCount: u32,
+        pub PeakWorkingSetSize: usize,
+        pub WorkingSetSize: usize,
+        pub QuotaPeakPagedPoolUsage: usize,
+        pub QuotaPagedPoolUsage: usize,
+        pub QuotaPeakNonPagedPoolUsage: usize,
+        pub QuotaNonPagedPoolUsage: usize,
+        pub PagefileUsage: usize,
+        pub PeakPagefileUsage: usize,
+    }
+
+    const TH32CS_SNAPPROCESS: u32 = 0x00000002;
+    const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
+    const PROCESS_VM_READ: u32 = 0x0010;
+    const INVALID_HANDLE_VALUE: isize = -1;
+    const MAX_PATH: usize = 260;
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct PROCESSENTRY32W {
+        dwSize: u32,
+        cntUsage: u32,
+        th32ProcessID: u32,
+        th32DefaultHeapID: usize,
+        th32ModuleID: u32,
+        cntThreads: u32,
+        th32ParentProcessID: u32,
+        pcPriClassBase: i32,
+        dwFlags: u32,
+        szExeFile: [u16; MAX_PATH],
     }
 
     extern "system" {
@@ -128,19 +164,93 @@ fn process_working_set_mb() -> f64 {
             ppsmem_counters: *mut ProcessMemoryCounters,
             cb: u32,
         ) -> i32;
+        fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> isize;
+        fn Process32FirstW(hSnapshot: isize, lppe: *mut PROCESSENTRY32W) -> i32;
+        fn Process32NextW(hSnapshot: isize, lppe: *mut PROCESSENTRY32W) -> i32;
+        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> isize;
+        fn CloseHandle(hObject: isize) -> i32;
     }
 
-    unsafe {
-        let handle = GetCurrentProcess();
-        let mut counters: ProcessMemoryCounters = mem::zeroed();
-        counters.cb = mem::size_of::<ProcessMemoryCounters>() as u32;
-        if K32GetProcessMemoryInfo(handle, &mut counters, counters.cb) != 0 {
-            counters.WorkingSetSize as f64 / (1024.0 * 1024.0)
-        } else {
-            0.0
+    /// Returns the current process working set in MB.
+    pub fn process_working_set_mb() -> f64 {
+        unsafe {
+            let handle = GetCurrentProcess();
+            let mut c: ProcessMemoryCounters = mem::zeroed();
+            c.cb = mem::size_of::<ProcessMemoryCounters>() as u32;
+            if K32GetProcessMemoryInfo(handle, &mut c, c.cb) != 0 {
+                c.WorkingSetSize as f64 / (1024.0 * 1024.0)
+            } else {
+                0.0
+            }
+        }
+    }
+
+    /// Returns the total working set (MB) of all processes matching any given name.
+    /// Uses Win32 toolhelp snapshot — no PowerShell overhead.
+    pub fn external_process_ws_mb(target_names: &[&str]) -> f64 {
+        use std::os::windows::ffi::OsStringExt;
+
+        if target_names.is_empty() {
+            return 0.0;
+        }
+
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snap == INVALID_HANDLE_VALUE {
+                return 0.0;
+            }
+
+            let mut entry: PROCESSENTRY32W = mem::zeroed();
+            entry.dwSize = mem::size_of::<PROCESSENTRY32W>() as u32;
+
+            let mut total_ws: f64 = 0.0;
+
+            if Process32FirstW(snap, &mut entry) != 0 {
+                loop {
+                    let name_len = entry
+                        .szExeFile
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(MAX_PATH);
+                    let exe_name = std::ffi::OsString::from_wide(&entry.szExeFile[..name_len])
+                        .to_string_lossy()
+                        .to_lowercase();
+
+                    let matches = target_names.iter().any(|t| {
+                        let target = t.to_lowercase();
+                        exe_name == target || exe_name == format!("{}.exe", target)
+                    });
+
+                    if matches {
+                        let proc_handle = OpenProcess(
+                            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+                            0,
+                            entry.th32ProcessID,
+                        );
+                        if proc_handle != 0 {
+                            let mut c: ProcessMemoryCounters = mem::zeroed();
+                            c.cb = mem::size_of::<ProcessMemoryCounters>() as u32;
+                            if K32GetProcessMemoryInfo(proc_handle, &mut c, c.cb) != 0 {
+                                total_ws += c.WorkingSetSize as f64;
+                            }
+                            CloseHandle(proc_handle);
+                        }
+                    }
+
+                    if Process32NextW(snap, &mut entry) == 0 {
+                        break;
+                    }
+                }
+            }
+
+            CloseHandle(snap);
+            total_ws / (1024.0 * 1024.0)
         }
     }
 }
+
+#[cfg(target_os = "windows")]
+use mem_win::{external_process_ws_mb, process_working_set_mb};
 
 #[cfg(not(target_os = "windows"))]
 fn process_working_set_mb() -> f64 {
@@ -155,6 +265,11 @@ fn process_working_set_mb() -> f64 {
             }
         }
     }
+    0.0
+}
+
+#[cfg(not(target_os = "windows"))]
+fn external_process_ws_mb(_target_names: &[&str]) -> f64 {
     0.0
 }
 
@@ -430,17 +545,88 @@ struct DensityEntry {
     create_ms: f64,
     execute_ms: f64,
     exit_code: i32,
+    /// Process WS after execute returns (persistent memory).
     process_ws_mb: f64,
+    /// Peak process WS polled during execute (captures ephemeral VM memory).
+    peak_ws_during_exec_mb: f64,
+    /// Peak external daemon WS during execute (captures nanvixd subprocess).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peak_daemon_ws_mb: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct DensityResult {
     backend: String,
     count: usize,
+    /// Whether VM/container memory is ephemeral (freed after execute).
+    ephemeral: bool,
     entries: Vec<DensityEntry>,
     baseline_ws_mb: f64,
     final_ws_mb: f64,
-    per_runner_mb: f64,
+    /// Persistent per-runner overhead (WS that stays after execute).
+    per_runner_persistent_mb: f64,
+    /// Peak per-execution overhead (WS during execute, includes ephemeral VM).
+    per_exec_peak_mb: f64,
+    /// External daemon memory growth.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon_names: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    baseline_daemon_ws_mb: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    final_daemon_ws_mb: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    per_runner_daemon_mb: Option<f64>,
+    /// The cost used for density estimation:
+    /// - Persistent backends (Hyperlight): persistent per-runner + daemon
+    /// - Ephemeral backends (NanVix/WSLc): peak per-execution + daemon
+    density_cost_mb: f64,
+    fits_in_1500mb: usize,
+}
+
+/// Polls process WS and external daemon WS in a background thread during
+/// execute(). Returns (ScriptResponse, exec_ms, peak_process_ws_mb, peak_daemon_ws_mb).
+///
+/// For NanVix, nanvixd.exe is spawned as a short-lived subprocess during
+/// execute() — this captures its WS while it's alive.
+fn execute_with_peak_ws(
+    runner: &mut dyn ScriptRunner,
+    request: &ExecutionRequest,
+    daemon_names: Vec<String>,
+) -> (ScriptResponse, f64, f64, f64) {
+    let running = Arc::new(AtomicBool::new(true));
+    let peak_proc = Arc::new(Mutex::new(0.0f64));
+    let peak_daemon = Arc::new(Mutex::new(0.0f64));
+
+    let running_c = running.clone();
+    let peak_proc_c = peak_proc.clone();
+    let peak_daemon_c = peak_daemon.clone();
+    let poller = std::thread::spawn(move || {
+        let names: Vec<&str> = daemon_names.iter().map(|s| s.as_str()).collect();
+        while running_c.load(Ordering::Relaxed) {
+            let ws = process_working_set_mb();
+            {
+                let mut p = peak_proc_c.lock().unwrap();
+                if ws > *p { *p = ws; }
+            }
+            if !names.is_empty() {
+                let dws = external_process_ws_mb(&names);
+                let mut p = peak_daemon_c.lock().unwrap();
+                if dws > *p { *p = dws; }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    let t = Instant::now();
+    let resp = runner.execute(request, &mut Logger::new(Mode::Buffer));
+    let exec_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    running.store(false, Ordering::Relaxed);
+    poller.join().unwrap();
+
+    let peak_ws = *peak_proc.lock().unwrap();
+    let peak_dws = *peak_daemon.lock().unwrap();
+    (resp, exec_ms, peak_ws, peak_dws)
 }
 
 fn density_test(
@@ -453,13 +639,31 @@ fn density_test(
 
     for backend in backends {
         let name = backend_display_name(backend);
+        let dnames = daemon_process_names(backend);
+        let has_daemon = !dnames.is_empty();
+        let ephemeral = is_ephemeral_backend(backend);
         let request = make_request(backend, wslc_image, None, workload);
 
         eprintln!("\n{}", "=".repeat(60));
         eprintln!("  Density test: {name} × {n} runners");
+        if ephemeral {
+            eprintln!("  Memory model: ephemeral (VM freed after each execute)");
+        } else {
+            eprintln!("  Memory model: persistent (snapshot stays in process)");
+        }
+        if has_daemon {
+            eprintln!("  Daemon processes: {:?}", dnames);
+        }
         eprintln!("{}", "=".repeat(60));
 
         let baseline_ws = process_working_set_mb();
+        let baseline_daemon_ws = if has_daemon {
+            let ws = external_process_ws_mb(&dnames);
+            eprintln!("  Baseline daemon WS: {ws:.1} MB");
+            Some(ws)
+        } else {
+            None
+        };
         eprintln!("  Baseline process WS: {baseline_ws:.1} MB");
 
         let mut runners = Vec::with_capacity(n);
@@ -479,21 +683,29 @@ fn density_test(
             let create_ms = t_create.elapsed().as_secs_f64() * 1000.0;
             runners.push(resolved);
 
-            // Execute once to force full initialization
-            let t_exec = Instant::now();
-            let resp = runners
-                .last_mut()
-                .unwrap()
-                .runner
-                .execute(&request, &mut Logger::new(Mode::Buffer));
-            let exec_ms = t_exec.elapsed().as_secs_f64() * 1000.0;
+            // Execute once with peak WS polling (also polls daemon WS during execute)
+            let daemon_names_owned: Vec<String> = dnames.iter().map(|s| s.to_string()).collect();
+            let (resp, exec_ms, peak_ws, peak_dws) = execute_with_peak_ws(
+                runners.last_mut().unwrap().runner.as_mut(),
+                &request,
+                daemon_names_owned,
+            );
 
             let ws = process_working_set_mb();
-            eprintln!(
-                "  [{name}] runner {}/{n}: create={create_ms:.1}ms  exec={exec_ms:.1}ms  exit={}  WS={ws:.1}MB",
-                i + 1,
-                resp.exit_code
-            );
+
+            if has_daemon {
+                eprintln!(
+                    "  [{name}] runner {}/{n}: create={create_ms:.1}ms  exec={exec_ms:.1}ms  exit={}  WS={ws:.1}MB  peakWS={peak_ws:.1}MB  peakDaemon={peak_dws:.1}MB",
+                    i + 1,
+                    resp.exit_code,
+                );
+            } else {
+                eprintln!(
+                    "  [{name}] runner {}/{n}: create={create_ms:.1}ms  exec={exec_ms:.1}ms  exit={}  WS={ws:.1}MB  peakWS={peak_ws:.1}MB",
+                    i + 1,
+                    resp.exit_code,
+                );
+            }
 
             entries.push(DensityEntry {
                 index: i + 1,
@@ -501,37 +713,116 @@ fn density_test(
                 execute_ms: exec_ms,
                 exit_code: resp.exit_code,
                 process_ws_mb: ws,
+                peak_ws_during_exec_mb: peak_ws,
+                peak_daemon_ws_mb: if has_daemon { Some(peak_dws) } else { None },
             });
         }
 
         let final_ws = process_working_set_mb();
+        let final_daemon_ws = if has_daemon {
+            Some(external_process_ws_mb(&dnames))
+        } else {
+            None
+        };
+
         let alive = runners.len();
-        let per_runner = if alive > 0 {
+        let per_runner_persistent = if alive > 0 {
             (final_ws - baseline_ws) / alive as f64
         } else {
             0.0
         };
 
-        eprintln!("  [{name}] {alive}/{n} runners alive");
-        eprintln!("  [{name}] Final WS: {final_ws:.1} MB  (baseline: {baseline_ws:.1} MB)");
-        eprintln!(
-            "  [{name}] Per-runner overhead: {per_runner:.1} MB  (total delta: {:.1} MB)",
-            final_ws - baseline_ws
-        );
+        // For ephemeral backends, peak-during-execute captures the VM cost.
+        // We take the median peak delta across all executions.
+        let per_exec_peak = if !entries.is_empty() {
+            let mut deltas: Vec<f64> = entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    let before = if i == 0 {
+                        baseline_ws
+                    } else {
+                        entries[i - 1].process_ws_mb
+                    };
+                    (e.peak_ws_during_exec_mb - before).max(0.0)
+                })
+                .collect();
+            deltas.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            deltas[deltas.len() / 2] // median
+        } else {
+            0.0
+        };
 
-        // Check against Stuart's target: ≤128 MB per sandbox, ≥12 in 1.5 GB
-        let fits_in_1500mb = ((1500.0 - baseline_ws) / per_runner).floor() as usize;
+        // Daemon cost depends on whether it's a subprocess or persistent service:
+        // - nanvixd: short-lived subprocess (baseline WS = 0). Per-exec cost = peak WS.
+        // - wslservice: persistent service (baseline WS > 0). Per-exec cost = peak - baseline.
+        let per_runner_daemon = if has_daemon && !entries.is_empty() {
+            let baseline_dws = baseline_daemon_ws.unwrap_or(0.0);
+            let mut deltas: Vec<f64> = entries
+                .iter()
+                .filter_map(|e| e.peak_daemon_ws_mb.map(|p| (p - baseline_dws).max(0.0)))
+                .collect();
+            deltas.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            if !deltas.is_empty() {
+                Some(deltas[deltas.len() / 2]) // median peak delta
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Choose the right cost metric for density estimation
+        let density_cost = if ephemeral {
+            // Ephemeral: per-execution peak (process WS) + daemon subprocess cost
+            per_exec_peak + per_runner_daemon.unwrap_or(0.0)
+        } else {
+            // Persistent: per-runner WS (snapshot stays in memory) + daemon
+            per_runner_persistent + per_runner_daemon.unwrap_or(0.0)
+        };
+
+        let fits = if density_cost > 0.0 {
+            ((1500.0 - baseline_ws) / density_cost).floor() as usize
+        } else {
+            0
+        };
+
+        eprintln!("  [{name}] {alive}/{n} runners alive");
         eprintln!(
-            "  [{name}] At {per_runner:.1} MB/runner: ~{fits_in_1500mb} fit in 1.5 GB budget"
+            "  [{name}] Persistent per-runner: {per_runner_persistent:.1} MB"
+        );
+        eprintln!(
+            "  [{name}] Peak per-execution:    {per_exec_peak:.1} MB"
+        );
+        if let (Some(d), Some(b)) = (per_runner_daemon, baseline_daemon_ws) {
+            let label = if b < 0.1 { "subprocess" } else { "service delta" };
+            eprintln!(
+                "  [{name}] Daemon ({label}):      {d:.1} MB/exec  (baseline={b:.1}MB)"
+            );
+        }
+        eprintln!(
+            "  [{name}] => Density cost: {density_cost:.1} MB/runner  (~{fits} fit in 1.5 GB)"
         );
 
         results.push(DensityResult {
             backend: name.to_string(),
             count: alive,
+            ephemeral,
             entries,
             baseline_ws_mb: baseline_ws,
             final_ws_mb: final_ws,
-            per_runner_mb: per_runner,
+            per_runner_persistent_mb: per_runner_persistent,
+            per_exec_peak_mb: per_exec_peak,
+            daemon_names: if has_daemon {
+                Some(dnames.iter().map(|s| s.to_string()).collect())
+            } else {
+                None
+            },
+            baseline_daemon_ws_mb: baseline_daemon_ws,
+            final_daemon_ws_mb: final_daemon_ws,
+            per_runner_daemon_mb: per_runner_daemon,
+            density_cost_mb: density_cost,
+            fits_in_1500mb: fits,
         });
 
         // Drop runners before next backend
@@ -762,14 +1053,10 @@ fn main() {
         eprintln!("  DENSITY SUMMARY");
         eprintln!("{}", "=".repeat(60));
         for r in &results {
+            let model = if r.ephemeral { "ephemeral" } else { "persistent" };
             eprintln!(
-                "  {:20} {}/{} runners  per-runner={:.1}MB  total={:.1}MB  (~{} fit in 1.5GB)",
-                r.backend,
-                r.count,
-                n,
-                r.per_runner_mb,
-                r.final_ws_mb - r.baseline_ws_mb,
-                ((1500.0 - r.baseline_ws_mb) / r.per_runner_mb).floor() as usize,
+                "  {:20} {}/{} runners  cost={:.1}MB/runner ({})  ~{} fit in 1.5GB",
+                r.backend, r.count, n, r.density_cost_mb, model, r.fits_in_1500mb,
             );
         }
 
