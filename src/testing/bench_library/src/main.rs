@@ -381,16 +381,22 @@ fn compute_stats(times: &[f64]) -> Stats {
 /// Python source for the "hello" workload (trivial, <1ms guest time).
 const HELLO_PY: &str = "import sys, time; t0=time.time(); print(f'Hello from library bench! Python {sys.version}'); print(f'ELAPSED_GUEST_MS={int((time.time()-t0)*1000)}')";
 
-/// Python source for the "compute" workload (~100-200ms CPU-bound).
-/// Fibonacci is a pure-Python CPU benchmark with no dependencies.
-const COMPUTE_PY: &str = r#"import sys, time
-sys.set_int_max_str_digits(100000)
+/// Python source for the "compute" workload — JSON serialization benchmark.
+/// Uses json (stdlib, pre-warmed in Hyperlight's snapshot) to build, serialize,
+/// and parse a 10k-record dataset 10 times. Shows pre-warming advantage (json is
+/// pre-loaded in HL snapshot, cold-imported ~48ms on NanVix) plus CPU compute.
+const COMPUTE_PY: &str = r#"import time
 t0 = time.time()
-a, b = 0, 1
-for _ in range(200000):
-    a, b = b, a + b
+import json
+t_import = (time.time() - t0) * 1000
+data = []
+for i in range(10000):
+    data.append({'id': i, 'name': 'item_' + str(i), 'value': round((i * 17 % 997) / 10.0, 2), 'tags': ['tag_' + str(i % 10), 'cat_' + str(i % 5)], 'active': i % 3 != 0})
+for _ in range(10):
+    s = json.dumps(data)
+    parsed = json.loads(s)
 elapsed_ms = (time.time() - t0) * 1000
-print(f'fib(200000): {len(str(a))} digits in {elapsed_ms:.0f}ms')
+print(f'json: {len(data)} records, {len(s)} chars, 10 rounds, import={t_import:.0f}ms, total={elapsed_ms:.0f}ms')
 print(f'ELAPSED_GUEST_MS={int(elapsed_ms)}')"#;
 
 fn workload_py_src(name: &str) -> &'static str {
@@ -1643,10 +1649,10 @@ if (multiWorkload) {{
       tab.classList.add('active');
       document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
       document.getElementById('wl-' + wi).classList.add('active');
-      // redraw canvases in the newly visible panel (rAF waits for layout)
-      requestAnimationFrame(() => {{
+      // redraw canvases in the newly visible panel (delay for layout reflow)
+      setTimeout(() => {{
         allCanvases.filter(c => c.panel === wi).forEach(c => c.draw());
-      }});
+      }}, 50);
     }};
     tabBar.appendChild(tab);
   }});
@@ -1670,9 +1676,9 @@ D.workloads.forEach((wl, wi) => {{
     const box = h('div', {{className: 'chart-box'}});
     const cv = h('canvas', {{height: '220'}});
     box.appendChild(cv); panel.appendChild(box);
-    const draw = () => drawLatencyChart(cv, warmDs);
+    const draw = () => {{ if (cv.getBoundingClientRect().width > 0) drawLatencyChart(cv, warmDs); }};
     allCanvases.push({{ panel: wi, draw }});
-    setTimeout(draw, 0);
+    if (wi === 0 || !multiWorkload) setTimeout(draw, 0);
     window.addEventListener('resize', draw);
   }}
 
@@ -1685,22 +1691,21 @@ D.workloads.forEach((wl, wi) => {{
     const box = h('div', {{className: 'chart-box'}});
     const cv = h('canvas', {{height: '220'}});
     box.appendChild(cv); panel.appendChild(box);
-    const draw = () => drawLatencyChart(cv, coldDs);
+    const draw = () => {{ if (cv.getBoundingClientRect().width > 0) drawLatencyChart(cv, coldDs); }};
     allCanvases.push({{ panel: wi, draw }});
-    setTimeout(draw, 0);
+    if (wi === 0 || !multiWorkload) setTimeout(draw, 0);
     window.addEventListener('resize', draw);
   }}
 
   // Warm-start detail
   panel.appendChild(h('h2', null, 'Warm-start detail'));
   const wHead = h('thead', null, h('tr', null,
-    ...['Backend','Median','Mean','Min','Max','P95','Stdev','Setup'].map(t => h('th', null, t))));
+    ...['Backend','Median','Mean','Min','Max','P95','Stdev'].map(t => h('th', null, t))));
   const wBody = h('tbody', null, ...wl.warm_start.map(w => {{
-    if (w.error) return h('tr', null, h('td', null, w.backend), h('td', {{colspan:'7'}}, w.error));
+    if (w.error) return h('tr', null, h('td', null, w.backend), h('td', {{colspan:'6'}}, w.error));
     const s = w.stats;
     return h('tr', null, h('td',null,w.backend),
-      ...[s.median_ms,s.mean_ms,s.min_ms,s.max_ms,s.p95_ms,s.stdev_ms].map(v=>h('td',null,fmt(v))),
-      h('td',null,fmt(w.runner_create_ms||0)+'ms'));
+      ...[s.median_ms,s.mean_ms,s.min_ms,s.max_ms,s.p95_ms,s.stdev_ms].map(v=>h('td',null,fmt(v))));
   }}));
   panel.appendChild(h('table', null, wHead, wBody));
 
