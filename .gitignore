@@ -48,3 +48,13 @@ output
 
 # iterative-review working artifacts
 .review/
+
+# Benchmark output
+bench_*.html
+bench_*.json
+probe.json
+
+# Benchmark output
+bench_*.html
+bench_*.json
+probe.json
