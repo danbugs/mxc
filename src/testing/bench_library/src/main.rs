@@ -74,6 +74,15 @@ struct Cli {
     /// Mutually exclusive with normal benchmark mode.
     #[arg(long)]
     density: Option<usize>,
+
+    /// Run all benchmarks (cold-start, warm-start, density, disk) and produce
+    /// a unified HTML report. Implies --all. Use --output-html to set path.
+    #[arg(long)]
+    full: bool,
+
+    /// Number of density runners for --full mode (default: 8).
+    #[arg(long, default_value = "8")]
+    density_count: usize,
 }
 
 fn parse_backend(s: &str) -> Result<ContainmentBackend, String> {
@@ -247,10 +256,43 @@ mod mem_win {
             total_ws / (1024.0 * 1024.0)
         }
     }
+
+    /// Returns the peak working set (MB) of a process given its raw HANDLE.
+    /// Used to query PeakWorkingSet64 of a child process after it exits
+    /// (handle remains valid until closed).
+    pub fn process_peak_ws_by_handle(handle: isize) -> f64 {
+        unsafe {
+            let mut c: ProcessMemoryCounters = mem::zeroed();
+            c.cb = mem::size_of::<ProcessMemoryCounters>() as u32;
+            if K32GetProcessMemoryInfo(handle, &mut c, c.cb) != 0 {
+                c.PeakWorkingSetSize as f64 / (1024.0 * 1024.0)
+            } else {
+                0.0
+            }
+        }
+    }
+
+    /// Returns the actual on-disk allocation of a file (handles NTFS sparse/compressed).
+    pub fn file_actual_size_mb(path: &std::path::Path) -> f64 {
+        use std::os::windows::ffi::OsStrExt;
+        extern "system" {
+            fn GetCompressedFileSizeW(lpFileName: *const u16, lpFileSizeHigh: *mut u32) -> u32;
+        }
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut high: u32 = 0;
+        let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
+        if low == 0xFFFFFFFF && std::io::Error::last_os_error().raw_os_error() != Some(0) {
+            // GetCompressedFileSize failed — fall back to logical size
+            path.metadata().map(|m| m.len() as f64 / (1024.0 * 1024.0)).unwrap_or(0.0)
+        } else {
+            let size = ((high as u64) << 32) | (low as u64);
+            size as f64 / (1024.0 * 1024.0)
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
-use mem_win::{external_process_ws_mb, process_working_set_mb};
+use mem_win::{external_process_ws_mb, file_actual_size_mb, process_peak_ws_by_handle, process_working_set_mb};
 
 #[cfg(not(target_os = "windows"))]
 fn process_working_set_mb() -> f64 {
@@ -1025,13 +1067,526 @@ table.innerHTML = html;
 }
 
 // ---------------------------------------------------------------------------
+// Cold-start benchmark (spawn wxc-exec as subprocess)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+struct ColdStartEntry {
+    iteration: usize,
+    elapsed_ms: f64,
+    exit_code: i32,
+    peak_ws_mb: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ColdStartResult {
+    backend: String,
+    stats: Stats,
+    entries: Vec<ColdStartEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// Write a temp wxc-exec config for the given backend + workload.
+fn write_temp_config(
+    backend: &ContainmentBackend,
+    wslc_image: &str,
+    workload: &str,
+) -> std::path::PathBuf {
+    let py_src = workload_py_src(workload);
+    let json = match backend {
+        ContainmentBackend::Hyperlight => format!(
+            r#"{{"process":{{"commandLine":"{}","timeout":30000}},"containment":"hyperlight"}}"#,
+            py_src.replace('\\', "\\\\").replace('"', "\\\"")
+        ),
+        ContainmentBackend::MicroVm => format!(
+            r#"{{"process":{{"commandLine":"{}","timeout":30000}},"containment":"microvm"}}"#,
+            py_src.replace('\\', "\\\\").replace('"', "\\\"")
+        ),
+        ContainmentBackend::Wslc => {
+            let cmd = format!("python3 -c \\\"{}\\\"", py_src.replace('\n', "; ").replace('"', "\\\""));
+            format!(
+                r#"{{"version":"0.8.0","containerId":"bench-cold-wslc","containment":"wslc","process":{{"commandLine":"{cmd}","timeout":30000}},"network":{{"defaultPolicy":"block"}},"experimental":{{"wslc":{{"image":"{wslc_image}"}}}}}}"#
+            )
+        }
+        _ => String::new(),
+    };
+    let dir = std::env::temp_dir().join("mxc-bench");
+    fs::create_dir_all(&dir).ok();
+    let name = backend_display_name(backend).replace(' ', "_").replace('(', "").replace(')', "").to_lowercase();
+    let path = dir.join(format!("cold_{name}.json"));
+    fs::write(&path, &json).expect("write temp config");
+    path
+}
+
+fn cold_start_benchmark(
+    backend: &ContainmentBackend,
+    warmup: usize,
+    iterations: usize,
+    wslc_image: &str,
+    workload: &str,
+) -> ColdStartResult {
+    let name = backend_display_name(backend);
+    eprintln!("\n{}", "=".repeat(60));
+    eprintln!("  Cold-start: {name}");
+    eprintln!("  Warmup: {warmup}, Iterations: {iterations}");
+    eprintln!("{}", "=".repeat(60));
+
+    // Find wxc-exec next to bench-library
+    let exe_dir = std::env::current_exe()
+        .expect("current_exe")
+        .parent()
+        .expect("exe parent")
+        .to_path_buf();
+    let wxc_exec = exe_dir.join("wxc-exec.exe");
+    if !wxc_exec.exists() {
+        let msg = format!("wxc-exec.exe not found at {}", wxc_exec.display());
+        eprintln!("  ERROR: {msg}");
+        return ColdStartResult {
+            backend: name.to_string(),
+            stats: Stats { count: 0, min_ms: 0.0, max_ms: 0.0, mean_ms: 0.0, median_ms: 0.0, p95_ms: 0.0, stdev_ms: 0.0 },
+            entries: vec![],
+            error: Some(msg),
+        };
+    }
+
+    let config_path = write_temp_config(backend, wslc_image, workload);
+
+    // Helper: run one cold-start iteration
+    let run_one = |_iter: usize| -> Option<(f64, i32, f64)> {
+        use std::process::{Command, Stdio};
+
+        let t = Instant::now();
+        let mut child = Command::new(&wxc_exec)
+            .arg(config_path.to_str().unwrap())
+            .args(&["--experimental", "--debug"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+
+        let status = child.wait().ok()?;
+        let elapsed_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let exit_code = status.code().unwrap_or(-1);
+
+        #[cfg(target_os = "windows")]
+        let peak_ws = {
+            use std::os::windows::io::AsRawHandle;
+            process_peak_ws_by_handle(child.as_raw_handle() as isize)
+        };
+        #[cfg(not(target_os = "windows"))]
+        let peak_ws = 0.0;
+
+        Some((elapsed_ms, exit_code, peak_ws))
+    };
+
+    // Warmup
+    for w in 0..warmup {
+        if let Some((ms, exit, _)) = run_one(w) {
+            eprintln!("  [warmup {}/{}] {ms:.1}ms exit={exit}", w + 1, warmup);
+        }
+    }
+
+    // Timed iterations
+    let mut entries = Vec::with_capacity(iterations);
+    let mut times = Vec::with_capacity(iterations);
+
+    for i in 0..iterations {
+        match run_one(i) {
+            Some((ms, exit, peak_ws)) => {
+                times.push(ms);
+                entries.push(ColdStartEntry {
+                    iteration: i + 1,
+                    elapsed_ms: ms,
+                    exit_code: exit,
+                    peak_ws_mb: peak_ws,
+                });
+                eprintln!("  [{}/{}] {ms:.1}ms exit={exit} peakWS={peak_ws:.1}MB", i + 1, iterations);
+            }
+            None => {
+                eprintln!("  [{}/{}] FAILED to spawn", i + 1, iterations);
+            }
+        }
+    }
+
+    if times.is_empty() {
+        return ColdStartResult {
+            backend: name.to_string(),
+            stats: Stats { count: 0, min_ms: 0.0, max_ms: 0.0, mean_ms: 0.0, median_ms: 0.0, p95_ms: 0.0, stdev_ms: 0.0 },
+            entries,
+            error: Some("all iterations failed".into()),
+        };
+    }
+
+    let stats = compute_stats(&times);
+    eprintln!(
+        "  => median={:.1}ms  p99={:.1}ms  peakWS={:.1}MB",
+        stats.median_ms, stats.p95_ms,
+        entries.iter().map(|e| e.peak_ws_mb).fold(0.0f64, f64::max)
+    );
+
+    ColdStartResult { backend: name.to_string(), stats, entries, error: None }
+}
+
+// ---------------------------------------------------------------------------
+// Disk measurement
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+struct DiskResult {
+    backend: String,
+    total_mb: f64,
+    files: Vec<DiskFile>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DiskFile {
+    name: String,
+    logical_mb: f64,
+    actual_mb: f64,
+}
+
+fn measure_disk(backend: &ContainmentBackend) -> DiskResult {
+    let name = backend_display_name(backend);
+    let exe_dir = std::env::current_exe()
+        .expect("current_exe")
+        .parent()
+        .expect("exe parent")
+        .to_path_buf();
+
+    let file_list: Vec<std::path::PathBuf> = match backend {
+        ContainmentBackend::Hyperlight => vec![
+            exe_dir.join("snapshots").join("kernel.vmem"),
+            exe_dir.join("snapshots").join("kernel.whp.cbor"),
+        ],
+        ContainmentBackend::MicroVm => vec![
+            exe_dir.join("nanvixd.exe"),
+            exe_dir.join("nanvix_rootfs.img"),
+            exe_dir.join("python3.initrd"),
+        ],
+        ContainmentBackend::Wslc => vec![],  // OCI cache, hard to measure
+        _ => vec![],
+    };
+
+    let mut files = Vec::new();
+    let mut total = 0.0;
+
+    for path in &file_list {
+        if path.exists() {
+            let logical = path.metadata().map(|m| m.len() as f64 / (1024.0 * 1024.0)).unwrap_or(0.0);
+            #[cfg(target_os = "windows")]
+            let actual = file_actual_size_mb(path);
+            #[cfg(not(target_os = "windows"))]
+            let actual = logical;
+            total += actual;
+            files.push(DiskFile {
+                name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                logical_mb: logical,
+                actual_mb: actual,
+            });
+        }
+    }
+
+    DiskResult { backend: name.to_string(), total_mb: total, files }
+}
+
+// ---------------------------------------------------------------------------
+// Full benchmark (one command → one HTML)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+struct FullResult {
+    warm_start: Vec<BackendResult>,
+    cold_start: Vec<ColdStartResult>,
+    density: Vec<DensityResult>,
+    disk: Vec<DiskResult>,
+}
+
+fn generate_full_html(result: &FullResult) -> String {
+    let json_data = serde_json::to_string(&result).unwrap_or_default();
+
+    // Build the scorecard rows from data
+    format!(
+        r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MXC Containment Benchmark</title>
+<style>
+  :root {{
+    --bg: #fafafa; --fg: #1a1a2e; --card-bg: #fff; --border: #e0e0e0;
+    --accent1: #2563eb; --accent2: #dc2626; --accent3: #059669;
+    --grid: #f0f0f0; --muted: #666; --header-bg: #f5f5f5;
+  }}
+  @media (prefers-color-scheme: dark) {{
+    :root {{
+      --bg: #0d1117; --fg: #e6edf3; --card-bg: #161b22; --border: #30363d;
+      --accent1: #58a6ff; --accent2: #f85149; --accent3: #3fb950;
+      --grid: #21262d; --muted: #8b949e; --header-bg: #1c2128;
+    }}
+  }}
+  :root[data-theme="dark"] {{
+    --bg: #0d1117; --fg: #e6edf3; --card-bg: #161b22; --border: #30363d;
+    --accent1: #58a6ff; --accent2: #f85149; --accent3: #3fb950;
+    --grid: #21262d; --muted: #8b949e; --header-bg: #1c2128;
+  }}
+  :root[data-theme="light"] {{
+    --bg: #fafafa; --fg: #1a1a2e; --card-bg: #fff; --border: #e0e0e0;
+    --accent1: #2563eb; --accent2: #dc2626; --accent3: #059669;
+    --grid: #f0f0f0; --muted: #666; --header-bg: #f5f5f5;
+  }}
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--fg);
+    max-width: 960px; margin: 0 auto; padding: 2rem 1.5rem;
+    font-size: 14px; line-height: 1.5;
+  }}
+  h1 {{ font-size: 1.5rem; margin-bottom: 0.25rem; }}
+  h2 {{ font-size: 1.1rem; margin: 2rem 0 0.75rem; }}
+  .subtitle {{ color: var(--muted); margin-bottom: 2rem; font-size: 0.85rem; }}
+
+  table {{
+    width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums;
+    background: var(--card-bg); border: 1px solid var(--border); border-radius: 6px;
+    overflow: hidden; margin-bottom: 1.5rem;
+  }}
+  th, td {{ padding: 0.6rem 1rem; text-align: right; border-bottom: 1px solid var(--border); }}
+  th {{ background: var(--header-bg); font-weight: 600; font-size: 0.75rem;
+       text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }}
+  th:first-child, td:first-child {{ text-align: left; }}
+  tr:last-child td {{ border-bottom: none; }}
+
+  .note {{ color: var(--muted); font-size: 0.8rem; margin-top: -1rem; margin-bottom: 1.5rem; }}
+  canvas {{ width: 100% !important; }}
+  .chart-box {{
+    background: var(--card-bg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 1.25rem; margin-bottom: 1.5rem;
+  }}
+  .chart-title {{ font-size: 0.9rem; font-weight: 600; margin-bottom: 0.75rem; }}
+</style>
+</head>
+<body>
+
+<h1>MXC Containment Benchmark</h1>
+<p class="subtitle">Comparison of Hyperlight, NanVix, and WSLc backends</p>
+
+<div id="app"></div>
+
+<script>
+const D = {json_data};
+const COLORS = ['#2563eb', '#dc2626', '#059669'];
+const app = document.getElementById('app');
+
+function h(tag, attrs, ...children) {{
+  const el = document.createElement(tag);
+  if (attrs) Object.entries(attrs).forEach(([k,v]) => {{
+    if (k === 'className') el.className = v;
+    else if (k === 'style') Object.assign(el.style, v);
+    else el.setAttribute(k, v);
+  }});
+  children.flat().forEach(c => {{
+    if (typeof c === 'string') el.appendChild(document.createTextNode(c));
+    else if (c) el.appendChild(c);
+  }});
+  return el;
+}}
+
+function fmt(v, unit) {{
+  if (v == null || v === 0) return '—';
+  return v.toFixed(1) + (unit || '');
+}}
+
+// --- Summary table ---
+const backends = D.warm_start.filter(w => !w.error).map(w => w.backend);
+const rows = [];
+
+// Cold-start
+rows.push(['Cold-start median (ms)', ...backends.map(b => {{
+  const r = D.cold_start.find(c => c.backend === b);
+  return r && !r.error ? fmt(r.stats.median_ms) : '—';
+}})]);
+rows.push(['Cold-start p95 (ms)', ...backends.map(b => {{
+  const r = D.cold_start.find(c => c.backend === b);
+  return r && !r.error ? fmt(r.stats.p95_ms) : '—';
+}})]);
+
+// Warm-start
+rows.push(['Warm-start median (ms)', ...backends.map(b => {{
+  const r = D.warm_start.find(w => w.backend === b);
+  return r && !r.error ? fmt(r.stats.median_ms) : '—';
+}})]);
+rows.push(['Warm-start p95 (ms)', ...backends.map(b => {{
+  const r = D.warm_start.find(w => w.backend === b);
+  return r && !r.error ? fmt(r.stats.p95_ms) : '—';
+}})]);
+
+// Memory
+rows.push(['Per-process WS peak (MB)', ...backends.map(b => {{
+  const r = D.cold_start.find(c => c.backend === b);
+  if (!r || r.error) return '—';
+  const peak = Math.max(...r.entries.map(e => e.peak_ws_mb));
+  return fmt(peak);
+}})]);
+rows.push(['Density cost (MB/runner)', ...backends.map(b => {{
+  const r = D.density.find(d => d.backend === b);
+  return r ? fmt(r.density_cost_mb) : '—';
+}})]);
+rows.push(['Density: fits in 1.5 GB', ...backends.map(b => {{
+  const r = D.density.find(d => d.backend === b);
+  return r ? String(r.fits_in_1500mb) : '—';
+}})]);
+
+// Disk
+rows.push(['Disk footprint (MB)', ...backends.map(b => {{
+  const r = D.disk.find(d => d.backend === b);
+  return r && r.total_mb > 0 ? fmt(r.total_mb) : '—';
+}})]);
+
+const thead = h('thead', null, h('tr', null,
+  h('th', null, 'Metric'),
+  ...backends.map(b => h('th', null, b))
+));
+const tbody = h('tbody', null,
+  ...rows.map(r => h('tr', null, ...r.map((cell, i) => h(i === 0 ? 'td' : 'td', null, cell))))
+);
+app.appendChild(h('h2', null, 'Summary'));
+app.appendChild(h('table', null, thead, tbody));
+
+// --- Latency charts ---
+function drawLatencyChart(canvas, datasets, title) {{
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr; canvas.height = rect.height * dpr;
+  ctx.scale(dpr, dpr);
+  const W = rect.width, H = rect.height;
+  const pad = {{ top: 24, right: 20, bottom: 32, left: 56 }};
+  const pW = W - pad.left - pad.right, pH = H - pad.top - pad.bottom;
+
+  const allT = datasets.flatMap(d => d.values);
+  if (!allT.length) return;
+  const yMax = Math.max(...allT) * 1.15;
+  const maxN = Math.max(...datasets.map(d => d.values.length));
+
+  const cs = getComputedStyle(document.documentElement);
+  const fg = cs.getPropertyValue('--fg').trim() || '#333';
+  const grid = cs.getPropertyValue('--grid').trim() || '#eee';
+
+  // Y grid
+  ctx.strokeStyle = grid; ctx.lineWidth = 0.5;
+  for (let i = 0; i <= 4; i++) {{
+    const y = pad.top + pH - (i / 4) * pH;
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + pW, y); ctx.stroke();
+    ctx.fillStyle = fg; ctx.font = '10px sans-serif'; ctx.textAlign = 'right';
+    ctx.fillText((yMax * i / 4).toFixed(0), pad.left - 6, y + 3);
+  }}
+  ctx.fillStyle = fg; ctx.font = '10px sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText('Iteration', pad.left + pW / 2, H - 4);
+
+  datasets.forEach((ds, di) => {{
+    const color = COLORS[di % COLORS.length];
+    ctx.strokeStyle = color; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ds.values.forEach((v, j) => {{
+      const x = pad.left + (j / (maxN - 1 || 1)) * pW;
+      const y = pad.top + pH - (v / yMax) * pH;
+      j === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }});
+    ctx.stroke();
+    ctx.fillStyle = color;
+    ds.values.forEach((v, j) => {{
+      const x = pad.left + (j / (maxN - 1 || 1)) * pW;
+      const y = pad.top + pH - (v / yMax) * pH;
+      ctx.beginPath(); ctx.arc(x, y, 2.5, 0, Math.PI * 2); ctx.fill();
+    }});
+    // Legend
+    const lx = pad.left + 8 + di * 140, ly = pad.top + 12;
+    ctx.fillStyle = color; ctx.fillRect(lx, ly - 6, 10, 10);
+    ctx.fillStyle = fg; ctx.textAlign = 'left'; ctx.font = '11px sans-serif';
+    ctx.fillText(ds.label, lx + 14, ly + 3);
+  }});
+}}
+
+// Warm-start chart
+const warmDs = D.warm_start.filter(w => !w.error).map(w => ({{
+  label: w.backend, values: w.iterations.map(it => it.elapsed_ms)
+}}));
+if (warmDs.length) {{
+  app.appendChild(h('h2', null, 'Warm-start latency'));
+  const box = h('div', {{className: 'chart-box'}});
+  const cv = h('canvas', {{height: '220'}});
+  box.appendChild(cv); app.appendChild(box);
+  setTimeout(() => drawLatencyChart(cv, warmDs, 'Warm-start'), 0);
+  window.addEventListener('resize', () => drawLatencyChart(cv, warmDs, 'Warm-start'));
+}}
+
+// Cold-start chart
+const coldDs = D.cold_start.filter(c => !c.error).map(c => ({{
+  label: c.backend, values: c.entries.map(e => e.elapsed_ms)
+}}));
+if (coldDs.length) {{
+  app.appendChild(h('h2', null, 'Cold-start latency'));
+  const box = h('div', {{className: 'chart-box'}});
+  const cv = h('canvas', {{height: '220'}});
+  box.appendChild(cv); app.appendChild(box);
+  setTimeout(() => drawLatencyChart(cv, coldDs, 'Cold-start'), 0);
+  window.addEventListener('resize', () => drawLatencyChart(cv, coldDs, 'Cold-start'));
+}}
+
+// --- Detailed tables ---
+app.appendChild(h('h2', null, 'Warm-start detail'));
+const wHead = h('thead', null, h('tr', null, ...['Backend','Median','Mean','Min','Max','P95','Stdev','Setup'].map(t => h('th', null, t))));
+const wBody = h('tbody', null, ...D.warm_start.map(w => {{
+  if (w.error) return h('tr', null, h('td', null, w.backend), h('td', {{colspan:'7'}}, w.error));
+  const s = w.stats;
+  return h('tr', null, h('td',null,w.backend), ...[s.median_ms,s.mean_ms,s.min_ms,s.max_ms,s.p95_ms,s.stdev_ms].map(v=>h('td',null,fmt(v))), h('td',null,fmt(w.runner_create_ms||0)+'ms'));
+}}));
+app.appendChild(h('table', null, wHead, wBody));
+
+app.appendChild(h('h2', null, 'Cold-start detail'));
+const cHead = h('thead', null, h('tr', null, ...['Backend','Median','Mean','Min','Max','P95','Stdev','Peak WS'].map(t => h('th', null, t))));
+const cBody = h('tbody', null, ...D.cold_start.map(c => {{
+  if (c.error) return h('tr', null, h('td', null, c.backend), h('td', {{colspan:'7'}}, c.error));
+  const s = c.stats; const peakWs = Math.max(...c.entries.map(e => e.peak_ws_mb));
+  return h('tr', null, h('td',null,c.backend), ...[s.median_ms,s.mean_ms,s.min_ms,s.max_ms,s.p95_ms,s.stdev_ms].map(v=>h('td',null,fmt(v))), h('td',null,fmt(peakWs)+' MB'));
+}}));
+app.appendChild(h('table', null, cHead, cBody));
+
+app.appendChild(h('h2', null, 'Density'));
+const dHead = h('thead', null, h('tr', null, ...['Backend','Model','Cost (MB)','Persistent','Peak exec','Daemon','Fits 1.5GB'].map(t => h('th', null, t))));
+const dBody = h('tbody', null, ...D.density.map(d => {{
+  const model = d.ephemeral ? 'ephemeral' : 'persistent';
+  const daemon = d.per_runner_daemon_mb != null ? fmt(d.per_runner_daemon_mb) : '—';
+  return h('tr', null, h('td',null,d.backend), h('td',null,model),
+    h('td',null,fmt(d.density_cost_mb)), h('td',null,fmt(d.per_runner_persistent_mb)),
+    h('td',null,fmt(d.per_exec_peak_mb)), h('td',null,daemon), h('td',null,String(d.fits_in_1500mb)));
+}}));
+app.appendChild(h('table', null, dHead, dBody));
+
+if (D.disk.some(d => d.files.length)) {{
+  app.appendChild(h('h2', null, 'Disk footprint'));
+  const fHead = h('thead', null, h('tr', null, ...['Backend','Total (MB)','Files'].map(t => h('th', null, t))));
+  const fBody = h('tbody', null, ...D.disk.filter(d => d.files.length).map(d => {{
+    const files = d.files.map(f => `${{f.name}} (${{fmt(f.actual_mb)}} MB)`).join(', ');
+    return h('tr', null, h('td',null,d.backend), h('td',null,fmt(d.total_mb)), h('td',{{style:{{textAlign:'left'}}}},files));
+  }}));
+  app.appendChild(h('table', null, fHead, fBody));
+}}
+</script>
+</body>
+</html>"##
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
 fn main() {
     let cli = Cli::parse();
 
-    let backends: Vec<ContainmentBackend> = if cli.all {
+    let backends: Vec<ContainmentBackend> = if cli.all || cli.full {
         vec![
             ContainmentBackend::Hyperlight,
             ContainmentBackend::MicroVm,
@@ -1040,9 +1595,67 @@ fn main() {
     } else if let Some(b) = cli.backend {
         vec![b]
     } else {
-        eprintln!("Specify --backend <name> or --all");
+        eprintln!("Specify --backend <name>, --all, or --full");
         std::process::exit(1);
     };
+
+    // Full benchmark mode: one command → one HTML
+    if cli.full {
+        let output_path = cli.output_html.as_deref().unwrap_or("bench_report.html");
+
+        eprintln!("Running full benchmark: warm-start, cold-start, density, disk\n");
+
+        // 1. Warm-start
+        let warm_start: Vec<BackendResult> = backends
+            .iter()
+            .map(|b| benchmark_backend(b, cli.warmup, cli.iterations, &cli.wslc_image, None, &cli.workload))
+            .collect();
+
+        // 2. Cold-start
+        let cold_start: Vec<ColdStartResult> = backends
+            .iter()
+            .map(|b| cold_start_benchmark(b, cli.warmup, cli.iterations, &cli.wslc_image, &cli.workload))
+            .collect();
+
+        // 3. Density
+        let density = density_test(cli.density_count, &backends, &cli.wslc_image, &cli.workload);
+
+        // 4. Disk
+        let disk: Vec<DiskResult> = backends.iter().map(|b| measure_disk(b)).collect();
+
+        let result = FullResult { warm_start, cold_start, density, disk };
+
+        // Write JSON
+        if let Some(path) = &cli.output_json {
+            let json = serde_json::to_string_pretty(&result).expect("serialize");
+            fs::write(path, &json).expect("write JSON");
+            eprintln!("JSON written to {path}");
+        }
+
+        // Write HTML
+        let html = generate_full_html(&result);
+        fs::write(output_path, &html).expect("write HTML");
+        eprintln!("\nHTML report written to {output_path}");
+
+        // Print summary
+        eprintln!("\n{}", "=".repeat(60));
+        eprintln!("  FULL BENCHMARK SUMMARY");
+        eprintln!("{}", "=".repeat(60));
+        for b in &backends {
+            let name = backend_display_name(b);
+            let warm = result.warm_start.iter().find(|r| r.backend == name);
+            let cold = result.cold_start.iter().find(|r| r.backend == name);
+            let dens = result.density.iter().find(|r| r.backend == name);
+            let dsk = result.disk.iter().find(|r| r.backend == name);
+            eprintln!("  {name}:");
+            if let Some(w) = warm { if w.error.is_none() { eprintln!("    warm-start: {:.1}ms median", w.stats.median_ms); } }
+            if let Some(c) = cold { if c.error.is_none() { eprintln!("    cold-start: {:.1}ms median  peakWS={:.1}MB", c.stats.median_ms, c.entries.iter().map(|e| e.peak_ws_mb).fold(0.0f64, f64::max)); } }
+            if let Some(d) = dens { eprintln!("    density:    {:.1}MB/runner  ~{} fit in 1.5GB", d.density_cost_mb, d.fits_in_1500mb); }
+            if let Some(d) = dsk { if d.total_mb > 0.0 { eprintln!("    disk:       {:.1}MB", d.total_mb); } }
+        }
+
+        return;
+    }
 
     // Density test mode
     if let Some(n) = cli.density {
