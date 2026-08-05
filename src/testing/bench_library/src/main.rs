@@ -4,9 +4,10 @@
 //! Library-mode benchmark for MXC containment backends.
 //!
 //! Measures steady-state per-invocation latency (runner reuse, no process
-//! overhead) and per-runner memory density. For daemon-backed backends
-//! (NanVix, WSLc) where VM/container memory is ephemeral or lives in external
-//! processes, we measure peak WS during execution to capture the true per-VM cost.
+//! overhead), per-runner memory density (commit charge), and concurrent
+//! execution throughput. For daemon-backed backends (NanVix, WSLc) where
+//! VM/container memory is ephemeral or lives in external processes, we measure
+//! peak memory commit during execution to capture the true per-VM cost.
 //!
 //! Usage:
 //!   bench-library --backend hyperlight --iterations 20 --warmup 3
@@ -88,6 +89,10 @@ struct Cli {
     /// Number of density runners for --full mode (default: 8).
     #[arg(long, default_value = "8")]
     density_count: usize,
+
+    /// Number of concurrent runners for the parallel benchmark (default: 5).
+    #[arg(long, default_value = "5")]
+    parallel_count: usize,
 }
 
 fn parse_backend(s: &str) -> Result<ContainmentBackend, String> {
@@ -185,23 +190,24 @@ mod mem_win {
         fn CloseHandle(hObject: isize) -> i32;
     }
 
-    /// Returns the current process working set in MB.
-    pub fn process_working_set_mb() -> f64 {
+    /// Returns the current process memory commit charge (private bytes) in MB.
+    /// Commit = virtual memory backed by pagefile or physical RAM, regardless
+    /// of whether pages are currently resident. More stable than WS.
+    pub fn process_commit_mb() -> f64 {
         unsafe {
             let handle = GetCurrentProcess();
             let mut c: ProcessMemoryCounters = mem::zeroed();
             c.cb = mem::size_of::<ProcessMemoryCounters>() as u32;
             if K32GetProcessMemoryInfo(handle, &mut c, c.cb) != 0 {
-                c.WorkingSetSize as f64 / (1024.0 * 1024.0)
+                c.PagefileUsage as f64 / (1024.0 * 1024.0)
             } else {
                 0.0
             }
         }
     }
 
-    /// Returns the total working set (MB) of all processes matching any given name.
-    /// Uses Win32 toolhelp snapshot — no PowerShell overhead.
-    pub fn external_process_ws_mb(target_names: &[&str]) -> f64 {
+    /// Returns the total commit charge (MB) of all processes matching any given name.
+    pub fn external_process_commit_mb(target_names: &[&str]) -> f64 {
         use std::os::windows::ffi::OsStringExt;
 
         if target_names.is_empty() {
@@ -217,7 +223,7 @@ mod mem_win {
             let mut entry: PROCESSENTRY32W = mem::zeroed();
             entry.dwSize = mem::size_of::<PROCESSENTRY32W>() as u32;
 
-            let mut total_ws: f64 = 0.0;
+            let mut total: f64 = 0.0;
 
             if Process32FirstW(snap, &mut entry) != 0 {
                 loop {
@@ -245,7 +251,7 @@ mod mem_win {
                             let mut c: ProcessMemoryCounters = mem::zeroed();
                             c.cb = mem::size_of::<ProcessMemoryCounters>() as u32;
                             if K32GetProcessMemoryInfo(proc_handle, &mut c, c.cb) != 0 {
-                                total_ws += c.WorkingSetSize as f64;
+                                total += c.PagefileUsage as f64;
                             }
                             CloseHandle(proc_handle);
                         }
@@ -258,19 +264,17 @@ mod mem_win {
             }
 
             CloseHandle(snap);
-            total_ws / (1024.0 * 1024.0)
+            total / (1024.0 * 1024.0)
         }
     }
 
-    /// Returns the peak working set (MB) of a process given its raw HANDLE.
-    /// Used to query PeakWorkingSet64 of a child process after it exits
-    /// (handle remains valid until closed).
-    pub fn process_peak_ws_by_handle(handle: isize) -> f64 {
+    /// Returns the peak commit charge (MB) of a process given its raw HANDLE.
+    pub fn process_peak_commit_by_handle(handle: isize) -> f64 {
         unsafe {
             let mut c: ProcessMemoryCounters = mem::zeroed();
             c.cb = mem::size_of::<ProcessMemoryCounters>() as u32;
             if K32GetProcessMemoryInfo(handle, &mut c, c.cb) != 0 {
-                c.PeakWorkingSetSize as f64 / (1024.0 * 1024.0)
+                c.PeakPagefileUsage as f64 / (1024.0 * 1024.0)
             } else {
                 0.0
             }
@@ -297,10 +301,14 @@ mod mem_win {
 }
 
 #[cfg(target_os = "windows")]
-use mem_win::{external_process_ws_mb, file_actual_size_mb, process_peak_ws_by_handle, process_working_set_mb};
+use mem_win::{
+    external_process_commit_mb, file_actual_size_mb,
+    process_commit_mb, process_peak_commit_by_handle,
+};
 
 #[cfg(not(target_os = "windows"))]
-fn process_working_set_mb() -> f64 {
+fn process_commit_mb() -> f64 {
+    // Best-effort fallback: read VmRSS from /proc/self/status
     if let Ok(status) = fs::read_to_string("/proc/self/status") {
         for line in status.lines() {
             if line.starts_with("VmRSS:") {
@@ -316,7 +324,12 @@ fn process_working_set_mb() -> f64 {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn external_process_ws_mb(_target_names: &[&str]) -> f64 {
+fn external_process_commit_mb(_target_names: &[&str]) -> f64 {
+    0.0
+}
+
+#[cfg(not(target_os = "windows"))]
+fn process_peak_commit_by_handle(_handle: isize) -> f64 {
     0.0
 }
 
@@ -605,13 +618,13 @@ struct DensityEntry {
     create_ms: f64,
     execute_ms: f64,
     exit_code: i32,
-    /// Process WS after execute returns (persistent memory).
-    process_ws_mb: f64,
-    /// Peak process WS polled during execute (captures ephemeral VM memory).
-    peak_ws_during_exec_mb: f64,
-    /// Peak external daemon WS during execute (captures nanvixd subprocess).
+    /// Process commit charge after execute returns (persistent memory).
+    process_commit_mb: f64,
+    /// Peak process commit polled during execute (captures ephemeral VM memory).
+    peak_commit_during_exec_mb: f64,
+    /// Peak external daemon commit during execute (captures nanvixd subprocess).
     #[serde(skip_serializing_if = "Option::is_none")]
-    peak_daemon_ws_mb: Option<f64>,
+    peak_daemon_commit_mb: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -621,19 +634,19 @@ struct DensityResult {
     /// Whether VM/container memory is ephemeral (freed after execute).
     ephemeral: bool,
     entries: Vec<DensityEntry>,
-    baseline_ws_mb: f64,
-    final_ws_mb: f64,
-    /// Persistent per-runner overhead (WS that stays after execute).
+    baseline_commit_mb: f64,
+    final_commit_mb: f64,
+    /// Persistent per-runner overhead (commit that stays after execute).
     per_runner_persistent_mb: f64,
-    /// Peak per-execution overhead (WS during execute, includes ephemeral VM).
+    /// Peak per-execution overhead (commit during execute, includes ephemeral VM).
     per_exec_peak_mb: f64,
     /// External daemon memory growth.
     #[serde(skip_serializing_if = "Option::is_none")]
     daemon_names: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    baseline_daemon_ws_mb: Option<f64>,
+    baseline_daemon_commit_mb: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    final_daemon_ws_mb: Option<f64>,
+    final_daemon_commit_mb: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     per_runner_daemon_mb: Option<f64>,
     /// The cost used for density estimation:
@@ -645,12 +658,12 @@ struct DensityResult {
     note: Option<String>,
 }
 
-/// Polls process WS and external daemon WS in a background thread during
-/// execute(). Returns (ScriptResponse, exec_ms, peak_process_ws_mb, peak_daemon_ws_mb).
+/// Polls process commit charge and external daemon commit in a background thread
+/// during execute(). Returns (ScriptResponse, exec_ms, peak_process_commit_mb, peak_daemon_commit_mb).
 ///
 /// For NanVix, nanvixd.exe is spawned as a short-lived subprocess during
-/// execute() — this captures its WS while it's alive.
-fn execute_with_peak_ws(
+/// execute() — this captures its commit charge while it's alive.
+fn execute_with_peak_commit(
     runner: &mut dyn ScriptRunner,
     request: &ExecutionRequest,
     daemon_names: Vec<String>,
@@ -665,15 +678,15 @@ fn execute_with_peak_ws(
     let poller = std::thread::spawn(move || {
         let names: Vec<&str> = daemon_names.iter().map(|s| s.as_str()).collect();
         while running_c.load(Ordering::Relaxed) {
-            let ws = process_working_set_mb();
+            let commit = process_commit_mb();
             {
                 let mut p = peak_proc_c.lock().unwrap();
-                if ws > *p { *p = ws; }
+                if commit > *p { *p = commit; }
             }
             if !names.is_empty() {
-                let dws = external_process_ws_mb(&names);
+                let dc = external_process_commit_mb(&names);
                 let mut p = peak_daemon_c.lock().unwrap();
-                if dws > *p { *p = dws; }
+                if dc > *p { *p = dc; }
             }
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -686,9 +699,9 @@ fn execute_with_peak_ws(
     running.store(false, Ordering::Relaxed);
     poller.join().unwrap();
 
-    let peak_ws = *peak_proc.lock().unwrap();
-    let peak_dws = *peak_daemon.lock().unwrap();
-    (resp, exec_ms, peak_ws, peak_dws)
+    let peak_c = *peak_proc.lock().unwrap();
+    let peak_dc = *peak_daemon.lock().unwrap();
+    (resp, exec_ms, peak_c, peak_dc)
 }
 
 fn density_test(
@@ -718,15 +731,15 @@ fn density_test(
         }
         eprintln!("{}", "=".repeat(60));
 
-        let baseline_ws = process_working_set_mb();
-        let baseline_daemon_ws = if has_daemon {
-            let ws = external_process_ws_mb(&dnames);
-            eprintln!("  Baseline daemon WS: {ws:.1} MB");
-            Some(ws)
+        let baseline_commit = process_commit_mb();
+        let baseline_daemon_commit = if has_daemon {
+            let dc = external_process_commit_mb(&dnames);
+            eprintln!("  Baseline daemon commit: {dc:.1} MB");
+            Some(dc)
         } else {
             None
         };
-        eprintln!("  Baseline process WS: {baseline_ws:.1} MB");
+        eprintln!("  Baseline process commit: {baseline_commit:.1} MB");
 
         let mut runners = Vec::with_capacity(n);
         let mut entries = Vec::with_capacity(n);
@@ -745,25 +758,25 @@ fn density_test(
             let create_ms = t_create.elapsed().as_secs_f64() * 1000.0;
             runners.push(resolved);
 
-            // Execute once with peak WS polling (also polls daemon WS during execute)
+            // Execute once with peak commit polling (also polls daemon commit during execute)
             let daemon_names_owned: Vec<String> = dnames.iter().map(|s| s.to_string()).collect();
-            let (resp, exec_ms, peak_ws, peak_dws) = execute_with_peak_ws(
+            let (resp, exec_ms, peak_commit, peak_dc) = execute_with_peak_commit(
                 runners.last_mut().unwrap().runner.as_mut(),
                 &request,
                 daemon_names_owned,
             );
 
-            let ws = process_working_set_mb();
+            let commit = process_commit_mb();
 
             if has_daemon {
                 eprintln!(
-                    "  [{name}] runner {}/{n}: create={create_ms:.1}ms  exec={exec_ms:.1}ms  exit={}  WS={ws:.1}MB  peakWS={peak_ws:.1}MB  peakDaemon={peak_dws:.1}MB",
+                    "  [{name}] runner {}/{n}: create={create_ms:.1}ms  exec={exec_ms:.1}ms  exit={}  commit={commit:.1}MB  peakCommit={peak_commit:.1}MB  peakDaemon={peak_dc:.1}MB",
                     i + 1,
                     resp.exit_code,
                 );
             } else {
                 eprintln!(
-                    "  [{name}] runner {}/{n}: create={create_ms:.1}ms  exec={exec_ms:.1}ms  exit={}  WS={ws:.1}MB  peakWS={peak_ws:.1}MB",
+                    "  [{name}] runner {}/{n}: create={create_ms:.1}ms  exec={exec_ms:.1}ms  exit={}  commit={commit:.1}MB  peakCommit={peak_commit:.1}MB",
                     i + 1,
                     resp.exit_code,
                 );
@@ -774,22 +787,22 @@ fn density_test(
                 create_ms,
                 execute_ms: exec_ms,
                 exit_code: resp.exit_code,
-                process_ws_mb: ws,
-                peak_ws_during_exec_mb: peak_ws,
-                peak_daemon_ws_mb: if has_daemon { Some(peak_dws) } else { None },
+                process_commit_mb: commit,
+                peak_commit_during_exec_mb: peak_commit,
+                peak_daemon_commit_mb: if has_daemon { Some(peak_dc) } else { None },
             });
         }
 
-        let final_ws = process_working_set_mb();
-        let final_daemon_ws = if has_daemon {
-            Some(external_process_ws_mb(&dnames))
+        let final_commit = process_commit_mb();
+        let final_daemon_commit = if has_daemon {
+            Some(external_process_commit_mb(&dnames))
         } else {
             None
         };
 
         let alive = runners.len();
         let per_runner_persistent = if alive > 0 {
-            (final_ws - baseline_ws) / alive as f64
+            (final_commit - baseline_commit) / alive as f64
         } else {
             0.0
         };
@@ -802,11 +815,11 @@ fn density_test(
                 .enumerate()
                 .map(|(i, e)| {
                     let before = if i == 0 {
-                        baseline_ws
+                        baseline_commit
                     } else {
-                        entries[i - 1].process_ws_mb
+                        entries[i - 1].process_commit_mb
                     };
-                    (e.peak_ws_during_exec_mb - before).max(0.0)
+                    (e.peak_commit_during_exec_mb - before).max(0.0)
                 })
                 .collect();
             deltas.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -816,13 +829,13 @@ fn density_test(
         };
 
         // Daemon cost depends on whether it's a subprocess or persistent service:
-        // - nanvixd: short-lived subprocess (baseline WS = 0). Per-exec cost = peak WS.
-        // - wslservice: persistent service (baseline WS > 0). Per-exec cost = peak - baseline.
+        // - nanvixd: short-lived subprocess (baseline commit = 0). Per-exec cost = peak commit.
+        // - wslservice: persistent service (baseline > 0). Per-exec cost = peak - baseline.
         let per_runner_daemon = if has_daemon && !entries.is_empty() {
-            let baseline_dws = baseline_daemon_ws.unwrap_or(0.0);
+            let baseline_dc = baseline_daemon_commit.unwrap_or(0.0);
             let mut deltas: Vec<f64> = entries
                 .iter()
-                .filter_map(|e| e.peak_daemon_ws_mb.map(|p| (p - baseline_dws).max(0.0)))
+                .filter_map(|e| e.peak_daemon_commit_mb.map(|p| (p - baseline_dc).max(0.0)))
                 .collect();
             deltas.sort_by(|a, b| a.partial_cmp(b).unwrap());
             if !deltas.is_empty() {
@@ -836,15 +849,15 @@ fn density_test(
 
         // Choose the right cost metric for density estimation
         let density_cost = if ephemeral {
-            // Ephemeral: per-execution peak (process WS) + daemon subprocess cost
+            // Ephemeral: per-execution peak (process commit) + daemon subprocess cost
             per_exec_peak + per_runner_daemon.unwrap_or(0.0)
         } else {
-            // Persistent: per-runner WS (snapshot stays in memory) + daemon
+            // Persistent: per-runner commit (snapshot stays in memory) + daemon
             per_runner_persistent + per_runner_daemon.unwrap_or(0.0)
         };
 
         let fits = if density_cost > 0.0 {
-            ((1500.0 - baseline_ws) / density_cost).floor() as usize
+            ((1500.0 - baseline_commit) / density_cost).floor() as usize
         } else {
             0
         };
@@ -856,7 +869,7 @@ fn density_test(
         eprintln!(
             "  [{name}] Peak per-execution:    {per_exec_peak:.1} MB"
         );
-        if let (Some(d), Some(b)) = (per_runner_daemon, baseline_daemon_ws) {
+        if let (Some(d), Some(b)) = (per_runner_daemon, baseline_daemon_commit) {
             let label = if b < 0.1 { "subprocess" } else { "service delta" };
             eprintln!(
                 "  [{name}] Daemon ({label}):      {d:.1} MB/exec  (baseline={b:.1}MB)"
@@ -868,10 +881,10 @@ fn density_test(
 
         // WSLc containers run inside a WSL2 lightweight VM — the actual container
         // memory (Linux kernel, Python runtime) lives in the VM's address space and
-        // is not visible in any Windows process's working set. The numbers here
+        // is not visible in any Windows process's commit charge. The numbers here
         // capture only the Windows-side IPC/handle overhead.
         let note = if matches!(backend, ContainmentBackend::Wslc) {
-            Some("Windows-side overhead only — container memory lives in WSL2 VM, not visible in host process WS".into())
+            Some("Windows-side overhead only — container memory lives in WSL2 VM, not visible in host process commit".into())
         } else {
             None
         };
@@ -881,8 +894,8 @@ fn density_test(
             count: alive,
             ephemeral,
             entries,
-            baseline_ws_mb: baseline_ws,
-            final_ws_mb: final_ws,
+            baseline_commit_mb: baseline_commit,
+            final_commit_mb: final_commit,
             per_runner_persistent_mb: per_runner_persistent,
             per_exec_peak_mb: per_exec_peak,
             daemon_names: if has_daemon {
@@ -890,8 +903,8 @@ fn density_test(
             } else {
                 None
             },
-            baseline_daemon_ws_mb: baseline_daemon_ws,
-            final_daemon_ws_mb: final_daemon_ws,
+            baseline_daemon_commit_mb: baseline_daemon_commit,
+            final_daemon_commit_mb: final_daemon_commit,
             per_runner_daemon_mb: per_runner_daemon,
             density_cost_mb: density_cost,
             fits_in_1500mb: fits,
@@ -1106,7 +1119,7 @@ struct ColdStartEntry {
     iteration: usize,
     elapsed_ms: f64,
     exit_code: i32,
-    peak_ws_mb: f64,
+    peak_commit_mb: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1209,14 +1222,14 @@ fn cold_start_benchmark(
         let exit_code = status.code().unwrap_or(-1);
 
         #[cfg(target_os = "windows")]
-        let peak_ws = {
+        let peak_commit = {
             use std::os::windows::io::AsRawHandle;
-            process_peak_ws_by_handle(child.as_raw_handle() as isize)
+            process_peak_commit_by_handle(child.as_raw_handle() as isize)
         };
         #[cfg(not(target_os = "windows"))]
-        let peak_ws = 0.0;
+        let peak_commit = 0.0;
 
-        Some((elapsed_ms, exit_code, peak_ws))
+        Some((elapsed_ms, exit_code, peak_commit))
     };
 
     // Warmup
@@ -1232,15 +1245,15 @@ fn cold_start_benchmark(
 
     for i in 0..iterations {
         match run_one(i) {
-            Some((ms, exit, peak_ws)) => {
+            Some((ms, exit, peak_commit)) => {
                 times.push(ms);
                 entries.push(ColdStartEntry {
                     iteration: i + 1,
                     elapsed_ms: ms,
                     exit_code: exit,
-                    peak_ws_mb: peak_ws,
+                    peak_commit_mb: peak_commit,
                 });
-                eprintln!("  [{}/{}] {ms:.1}ms exit={exit} peakWS={peak_ws:.1}MB", i + 1, iterations);
+                eprintln!("  [{}/{}] {ms:.1}ms exit={exit} peakCommit={peak_commit:.1}MB", i + 1, iterations);
             }
             None => {
                 eprintln!("  [{}/{}] FAILED to spawn", i + 1, iterations);
@@ -1259,9 +1272,9 @@ fn cold_start_benchmark(
 
     let stats = compute_stats(&times);
     eprintln!(
-        "  => median={:.1}ms  p99={:.1}ms  peakWS={:.1}MB",
+        "  => median={:.1}ms  p99={:.1}ms  peakCommit={:.1}MB",
         stats.median_ms, stats.p95_ms,
-        entries.iter().map(|e| e.peak_ws_mb).fold(0.0f64, f64::max)
+        entries.iter().map(|e| e.peak_commit_mb).fold(0.0f64, f64::max)
     );
 
     ColdStartResult { backend: name.to_string(), stats, entries, error: None }
@@ -1403,6 +1416,218 @@ fn resolve_localappdata() -> std::path::PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// Parallel benchmark
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+struct ParallelEntry {
+    runner_index: usize,
+    elapsed_ms: f64,
+    exit_code: i32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ParallelRound {
+    round: usize,
+    wall_clock_ms: f64,
+    entries: Vec<ParallelEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ParallelResult {
+    backend: String,
+    concurrency: usize,
+    rounds: Vec<ParallelRound>,
+    /// Stats across per-round wall-clock times (max latency per round).
+    wall_clock_stats: Stats,
+    /// Stats across all individual runner latencies (shows contention impact).
+    per_runner_stats: Stats,
+    /// Throughput: concurrency / median_wall_clock_sec.
+    throughput_per_sec: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+fn parallel_benchmark(
+    backend: &ContainmentBackend,
+    concurrency: usize,
+    warmup: usize,
+    iterations: usize,
+    wslc_image: &str,
+    workload: &str,
+) -> ParallelResult {
+    let name = backend_display_name(backend);
+    eprintln!("\n{}", "=".repeat(60));
+    eprintln!("  Parallel: {name} × {concurrency} concurrent");
+    eprintln!("  Warmup: {warmup}, Rounds: {iterations}");
+    eprintln!("{}", "=".repeat(60));
+
+    // Each thread creates its own runner, warms up, then synchronizes via barrier.
+    // The barrier has concurrency+1 participants: N workers + main thread (for timing).
+    let barrier = Arc::new(std::sync::Barrier::new(concurrency + 1));
+    let round_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let total_rounds = warmup + iterations;
+    let all_entries: Arc<Mutex<Vec<(usize, usize, f64, i32)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+
+    let wslc_image_owned = wslc_image.to_string();
+    let workload_owned = workload.to_string();
+    let backend_clone = backend.clone();
+
+    let handles: Vec<_> = (0..concurrency)
+        .map(|idx| {
+            let barrier = barrier.clone();
+            let round_counter = round_counter.clone();
+            let all_entries = all_entries.clone();
+            let wslc_img = wslc_image_owned.clone();
+            let wl = workload_owned.clone();
+            let be = backend_clone.clone();
+
+            std::thread::spawn(move || {
+                let request = make_request(&be, &wslc_img, None, &wl);
+                let mut logger = Logger::new(Mode::Buffer);
+                let resolved = match mxc_engine::resolve_runner(&request, &mut logger) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("  [thread {idx}] failed to create runner: {e}");
+                        // Still participate in barriers so other threads don't deadlock
+                        for _ in 0..total_rounds {
+                            barrier.wait();
+                            barrier.wait();
+                        }
+                        return;
+                    }
+                };
+                let mut runner = resolved.runner;
+
+                // Warmup (each thread warms up its own runner independently)
+                for _ in 0..warmup {
+                    runner.execute(&request, &mut Logger::new(Mode::Buffer));
+                }
+
+                for _ in 0..total_rounds {
+                    // Wait for main thread to signal round start
+                    barrier.wait();
+
+                    let round = round_counter.load(Ordering::Relaxed);
+
+                    let t = Instant::now();
+                    let resp = runner.execute(&request, &mut Logger::new(Mode::Buffer));
+                    let ms = t.elapsed().as_secs_f64() * 1000.0;
+
+                    {
+                        let mut entries = all_entries.lock().unwrap();
+                        entries.push((round, idx, ms, resp.exit_code));
+                    }
+
+                    // Wait for all threads to finish this round
+                    barrier.wait();
+                }
+            })
+        })
+        .collect();
+
+    // Main thread drives the rounds
+    let mut rounds = Vec::with_capacity(iterations);
+    let mut wall_clocks = Vec::new();
+    let mut all_latencies = Vec::new();
+
+    for round_idx in 0..total_rounds {
+        round_counter.store(round_idx, Ordering::Relaxed);
+
+        // Signal round start
+        barrier.wait();
+
+        let wall_t = Instant::now();
+
+        // Wait for all threads to finish
+        barrier.wait();
+
+        let wall_ms = wall_t.elapsed().as_secs_f64() * 1000.0;
+
+        // Collect results for this round
+        let entries_lock = all_entries.lock().unwrap();
+        let round_entries: Vec<ParallelEntry> = entries_lock
+            .iter()
+            .filter(|(r, _, _, _)| *r == round_idx)
+            .map(|(_, idx, ms, exit)| ParallelEntry {
+                runner_index: *idx,
+                elapsed_ms: *ms,
+                exit_code: *exit,
+            })
+            .collect();
+        drop(entries_lock);
+
+        let is_warmup = round_idx < warmup;
+        let label = if is_warmup { "warmup" } else { "timed" };
+        eprintln!(
+            "  [round {}/{} {label}] wall={wall_ms:.1}ms  runners={}  latencies={:.1}-{:.1}ms",
+            round_idx + 1,
+            total_rounds,
+            round_entries.len(),
+            round_entries.iter().map(|e| e.elapsed_ms).fold(f64::MAX, f64::min),
+            round_entries.iter().map(|e| e.elapsed_ms).fold(0.0f64, f64::max),
+        );
+
+        if !is_warmup {
+            wall_clocks.push(wall_ms);
+            for e in &round_entries {
+                all_latencies.push(e.elapsed_ms);
+            }
+            rounds.push(ParallelRound {
+                round: round_idx - warmup + 1,
+                wall_clock_ms: wall_ms,
+                entries: round_entries,
+            });
+        }
+    }
+
+    // Join all threads
+    for h in handles {
+        h.join().ok();
+    }
+
+    if wall_clocks.is_empty() || all_latencies.is_empty() {
+        return ParallelResult {
+            backend: name.to_string(),
+            concurrency,
+            rounds: vec![],
+            wall_clock_stats: Stats { count: 0, min_ms: 0.0, max_ms: 0.0, mean_ms: 0.0, median_ms: 0.0, p95_ms: 0.0, stdev_ms: 0.0 },
+            per_runner_stats: Stats { count: 0, min_ms: 0.0, max_ms: 0.0, mean_ms: 0.0, median_ms: 0.0, p95_ms: 0.0, stdev_ms: 0.0 },
+            throughput_per_sec: 0.0,
+            error: Some("no successful rounds".into()),
+        };
+    }
+
+    let wall_stats = compute_stats(&wall_clocks);
+    let runner_stats = compute_stats(&all_latencies);
+    let throughput = if wall_stats.median_ms > 0.0 {
+        concurrency as f64 / (wall_stats.median_ms / 1000.0)
+    } else {
+        0.0
+    };
+
+    eprintln!(
+        "  => wall-clock: median={:.1}ms  throughput={:.0} exec/sec",
+        wall_stats.median_ms, throughput
+    );
+    eprintln!(
+        "  => per-runner: median={:.1}ms  mean={:.1}ms  p95={:.1}ms",
+        runner_stats.median_ms, runner_stats.mean_ms, runner_stats.p95_ms
+    );
+
+    ParallelResult {
+        backend: name.to_string(),
+        concurrency,
+        rounds,
+        wall_clock_stats: wall_stats,
+        per_runner_stats: runner_stats,
+        throughput_per_sec: throughput,
+        error: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Full benchmark (one command → one HTML)
 // ---------------------------------------------------------------------------
 
@@ -1412,6 +1637,7 @@ struct WorkloadResult {
     warm_start: Vec<BackendResult>,
     cold_start: Vec<ColdStartResult>,
     density: Vec<DensityResult>,
+    parallel: Vec<ParallelResult>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1599,7 +1825,7 @@ function drawLatencyChart(canvas, datasets) {{
   // Density (same across workloads, take from first)
   if (D.workloads.length) {{
     const wl0 = D.workloads[0];
-    sRows.push(['Density (MB/runner)', ...allBackends.map(b => {{
+    sRows.push(['Commit (MB/runner)', ...allBackends.map(b => {{
       const r = wl0.density.find(d => d.backend === b);
       if (!r) return '—';
       return r.note ? fmt(r.density_cost_mb) + ' *' : fmt(r.density_cost_mb);
@@ -1608,6 +1834,17 @@ function drawLatencyChart(canvas, datasets) {{
       const r = wl0.density.find(d => d.backend === b);
       if (!r) return '—';
       return r.note ? String(r.fits_in_1500mb) + ' *' : String(r.fits_in_1500mb);
+    }})]);
+  }}
+
+  // Parallel throughput (take from first workload)
+  if (D.workloads.length && D.workloads[0].parallel && D.workloads[0].parallel.length) {{
+    const wl0 = D.workloads[0];
+    const conc = wl0.parallel[0] ? wl0.parallel[0].concurrency : '?';
+    sRows.push(['Parallel throughput (' + conc + '×)', ...allBackends.map(b => {{
+      const r = wl0.parallel.find(p => p.backend === b);
+      if (!r || r.error) return '—';
+      return r.throughput_per_sec.toFixed(0) + ' exec/s';
     }})]);
   }}
 
@@ -1713,18 +1950,18 @@ D.workloads.forEach((wl, wi) => {{
   // Cold-start detail
   panel.appendChild(h('h2', null, 'Cold-start detail'));
   const cHead = h('thead', null, h('tr', null,
-    ...['Backend','Median','Mean','Min','Max','P95','Stdev','Peak WS'].map(t => h('th', null, t))));
+    ...['Backend','Median','Mean','Min','Max','P95','Stdev','Peak Commit'].map(t => h('th', null, t))));
   const cBody = h('tbody', null, ...wl.cold_start.map(c => {{
     if (c.error) return h('tr', null, h('td', null, c.backend), h('td', {{colspan:'7'}}, c.error));
-    const s = c.stats; const peakWs = Math.max(...c.entries.map(e => e.peak_ws_mb));
+    const s = c.stats; const peakC = Math.max(...c.entries.map(e => e.peak_commit_mb));
     return h('tr', null, h('td',null,c.backend),
       ...[s.median_ms,s.mean_ms,s.min_ms,s.max_ms,s.p95_ms,s.stdev_ms].map(v=>h('td',null,fmt(v))),
-      h('td',null,fmt(peakWs)+' MB'));
+      h('td',null,fmt(peakC)+' MB'));
   }}));
   panel.appendChild(h('table', null, cHead, cBody));
 
   // Density detail
-  panel.appendChild(h('h2', null, 'Density'));
+  panel.appendChild(h('h2', null, 'Density (memory commit)'));
   const dHead = h('thead', null, h('tr', null,
     ...['Backend','Cost (MB/runner)','Fits in 1.5 GB'].map(t => h('th', null, t))));
   const dBody = h('tbody', null, ...wl.density.map(d => {{
@@ -1732,6 +1969,41 @@ D.workloads.forEach((wl, wi) => {{
       h('td',null,fmt(d.density_cost_mb)), h('td',null,String(d.fits_in_1500mb)));
   }}));
   panel.appendChild(h('table', null, dHead, dBody));
+
+  // Parallel execution detail
+  if (wl.parallel && wl.parallel.length) {{
+    const validPar = wl.parallel.filter(p => !p.error);
+    if (validPar.length) {{
+      panel.appendChild(h('h2', null, 'Parallel execution (' + validPar[0].concurrency + '× concurrent)'));
+
+      // Parallel chart: wall-clock per round
+      const parDs = validPar.map(p => ({{
+        label: p.backend,
+        values: p.rounds.map(r => r.wall_clock_ms)
+      }}));
+      if (parDs.length) {{
+        const box = h('div', {{className: 'chart-box'}});
+        const cv = h('canvas', {{height: '220'}});
+        box.appendChild(cv); panel.appendChild(box);
+        const draw = () => {{ if (cv.getBoundingClientRect().width > 0) drawLatencyChart(cv, parDs); }};
+        allCanvases.push({{ panel: wi, draw }});
+        if (wi === 0 || !multiWorkload) setTimeout(draw, 0);
+        window.addEventListener('resize', draw);
+      }}
+
+      const pHead = h('thead', null, h('tr', null,
+        ...['Backend','Concurrency','Wall-clock (ms)','Per-runner (ms)','Throughput (exec/s)'].map(t => h('th', null, t))));
+      const pBody = h('tbody', null, ...validPar.map(p => {{
+        return h('tr', null,
+          h('td',null,p.backend),
+          h('td',null,String(p.concurrency)),
+          h('td',null,fmt(p.wall_clock_stats.median_ms)),
+          h('td',null,fmt(p.per_runner_stats.median_ms)),
+          h('td',null,p.throughput_per_sec.toFixed(0)));
+      }}));
+      panel.appendChild(h('table', null, pHead, pBody));
+    }}
+  }}
 
   app.appendChild(panel);
 }});
@@ -1811,11 +2083,18 @@ fn main() {
             // but we include it per-workload so the report shows exec times)
             let density = density_test(cli.density_count, &backends, &cli.wslc_image, wl);
 
+            // 4. Parallel (concurrent execution scaling)
+            let parallel: Vec<ParallelResult> = backends
+                .iter()
+                .map(|b| parallel_benchmark(b, cli.parallel_count, cli.warmup, cli.iterations, &cli.wslc_image, wl))
+                .collect();
+
             workload_results.push(WorkloadResult {
                 workload: wl.clone(),
                 warm_start,
                 cold_start,
                 density,
+                parallel,
             });
         }
 
@@ -1849,8 +2128,10 @@ fn main() {
                 let dens = wl_result.density.iter().find(|r| r.backend == name);
                 eprintln!("  {name}:");
                 if let Some(w) = warm { if w.error.is_none() { eprintln!("    warm-start: {:.1}ms median", w.stats.median_ms); } }
-                if let Some(c) = cold { if c.error.is_none() { eprintln!("    cold-start: {:.1}ms median  peakWS={:.1}MB", c.stats.median_ms, c.entries.iter().map(|e| e.peak_ws_mb).fold(0.0f64, f64::max)); } }
+                if let Some(c) = cold { if c.error.is_none() { eprintln!("    cold-start: {:.1}ms median  peakCommit={:.1}MB", c.stats.median_ms, c.entries.iter().map(|e| e.peak_commit_mb).fold(0.0f64, f64::max)); } }
                 if let Some(d) = dens { eprintln!("    density:    {:.1}MB/runner  ~{} fit in 1.5GB", d.density_cost_mb, d.fits_in_1500mb); }
+                let par = wl_result.parallel.iter().find(|r| r.backend == name);
+                if let Some(p) = par { if p.error.is_none() { eprintln!("    parallel:   {:.0} exec/sec  ({}×, wall={:.1}ms)", p.throughput_per_sec, p.concurrency, p.wall_clock_stats.median_ms); } }
             }
         }
         for b in &backends {

@@ -1,6 +1,6 @@
 # MXC Containment Benchmarks
 
-Compares Hyperlight, NanVix (MicroVM), and WSLc backends across cold-start latency, warm-start latency, memory density, and disk footprint.
+Compares Hyperlight, NanVix (MicroVM), and WSLc backends across cold-start latency, warm-start latency, memory density (commit charge), parallel throughput, and disk footprint.
 
 ## Quick start
 
@@ -9,25 +9,30 @@ cd src
 cargo build --release -p bench_library -p wxc-exec --features hyperlight,microvm,wslc
 
 # Run all benchmarks with hello + compute workloads, output one HTML report
-.\target\release\bench-library.exe --full --iterations 10 --warmup 3 --density-count 8 --workloads hello,compute --output-html bench_report.html
+.\target\release\bench-library.exe --full --iterations 10 --warmup 3 --density-count 8 --parallel-count 5 --workloads hello,compute --output-html bench_report.html
 ```
 
 ## What `--full` measures
 
 | Metric | How |
 |--------|-----|
-| **Cold-start latency** | Spawns `wxc-exec.exe` per iteration, times full process lifetime (creation → teardown). Queries `PeakWorkingSet64` via raw process handle after exit. |
+| **Cold-start latency** | Spawns `wxc-exec.exe` per iteration, times full process lifetime (creation → teardown). Queries peak commit charge via raw process handle after exit. |
 | **Warm-start latency** | Creates runner once via `mxc_engine`, calls `execute()` in a loop. `Instant::now()` around each call; warmup iterations discarded. |
-| **Memory density** | Creates N runners, executes each once. Measures per-runner cost differently per backend (see below). Estimates how many fit in 1.5 GB. |
+| **Memory density** | Creates N runners, executes each once. Measures per-runner memory commit charge (not working set) per backend (see below). Estimates how many fit in 1.5 GB. |
+| **Parallel throughput** | Creates N concurrent runners (default 5), synchronizes via barrier, executes workload simultaneously. Measures wall-clock time, per-runner latency under contention, and throughput (exec/sec). |
 | **Disk footprint** | Measures runtime files. Sparse-aware via `GetCompressedFileSizeW`. |
+
+### Memory measurement: commit charge vs working set
+
+We measure **memory commit** (`PagefileUsage` from `PROCESS_MEMORY_COUNTERS`) rather than working set. Commit charge represents virtual memory backed by physical RAM or pagefile — it's stable across memory pressure changes (unlike WS, which the OS can trim). This gives more accurate density estimates, especially for WSLc where container memory lives in the WSL2 VM.
 
 ### Memory model per backend
 
-- **Hyperlight** — VM snapshot loaded in-process via WHP `WHvMapGpaRange`. Each runner holds ~16.8 MB persistently. Measured via `K32GetProcessMemoryInfo` on the bench-library process.
+- **Hyperlight** — VM snapshot loaded in-process via WHP `WHvMapGpaRange`. Each runner holds ~16.8 MB persistently. Measured via `K32GetProcessMemoryInfo` commit charge on the bench-library process.
 
-- **NanVix** — Each `execute()` spawns `nanvixd.exe` as a short-lived subprocess (~100ms). VM memory lives in nanvixd, not bench-library. Measured by polling `nanvixd.exe` WS via `CreateToolhelp32Snapshot` + `K32GetProcessMemoryInfo` during execution at 1ms intervals.
+- **NanVix** — Each `execute()` spawns `nanvixd.exe` as a short-lived subprocess (~100ms). VM memory lives in nanvixd, not bench-library. Measured by polling `nanvixd.exe` commit charge via `CreateToolhelp32Snapshot` + `K32GetProcessMemoryInfo` during execution at 1ms intervals.
 
-- **WSLc** — Each `execute()` creates a container via `wslservice.exe` (persistent system service, ~38 MB baseline). Measured as wslservice WS delta + bench-library client overhead. **Note:** container memory lives in the WSL2 VM and is not visible in host process WS — reported numbers capture Windows-side overhead only.
+- **WSLc** — Each `execute()` creates a container via `wslservice.exe` (persistent system service). Measured as wslservice commit delta + bench-library client overhead. **Note:** container memory lives in the WSL2 VM and is not visible in host process commit — reported numbers capture Windows-side overhead only.
 
 ### Disk footprint per backend
 
