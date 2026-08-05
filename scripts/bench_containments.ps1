@@ -182,16 +182,24 @@ function Invoke-Iteration {
         [string]$Backend
     )
 
-    $extraArgs = @("--experimental", "--debug")
-    $stdoutFile = [IO.Path]::GetTempFileName()
-    $stderrFile = [IO.Path]::GetTempFileName()
+    # Use raw .NET Process API to avoid Start-Process console-allocation overhead (~250ms).
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $Exe
+    $psi.Arguments = "$ConfigPath --experimental --debug"
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+
+    $p = New-Object System.Diagnostics.Process
+    $p.StartInfo = $psi
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    [void]$p.Start()
 
-    $p = Start-Process -FilePath $Exe -ArgumentList ($ConfigPath + " " + ($extraArgs -join " ")) `
-        -NoNewWindow -PassThru `
-        -RedirectStandardOutput $stdoutFile `
-        -RedirectStandardError $stderrFile
+    # Read stdout/stderr async to avoid deadlocks when buffers fill
+    $stdoutTask = $p.StandardOutput.ReadToEndAsync()
+    $stderrTask = $p.StandardError.ReadToEndAsync()
 
     # Poll for peak working set while process runs
     $peakWsMB = 0
@@ -203,24 +211,21 @@ function Invoke-Iteration {
         } catch {}
         Start-Sleep -Milliseconds 5
     }
-    # Final read after exit (handle still open from -PassThru)
+    # Final read after exit (handle still open)
     try {
         $p.Refresh()
         $wsMB = [math]::Round($p.PeakWorkingSet64 / 1MB, 2)
         if ($wsMB -gt $peakWsMB) { $peakWsMB = $wsMB }
     } catch {}
 
-    $p.WaitForExit()
-    $exitCode = $p.ExitCode
-    if ($null -eq $exitCode) { $exitCode = 0 }
-
     $sw.Stop()
 
-    $combined = ""
-    if (Test-Path $stdoutFile) { $combined += (Get-Content $stdoutFile -Raw) }
-    if (Test-Path $stderrFile) { $combined += (Get-Content $stderrFile -Raw) }
-    Remove-Item $stdoutFile -ErrorAction SilentlyContinue
-    Remove-Item $stderrFile -ErrorAction SilentlyContinue
+    $stdoutText = $stdoutTask.GetAwaiter().GetResult()
+    $stderrText = $stderrTask.GetAwaiter().GetResult()
+    $exitCode = $p.ExitCode
+    $p.Dispose()
+
+    $combined = "$stdoutText$stderrText"
 
     # Parse restore/call timing from hyperlight/nanvix log lines if present
     $restoreMs = -1
