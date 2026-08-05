@@ -1,137 +1,71 @@
 # MXC Containment Benchmarks
 
-Benchmark suite for comparing MXC containment backends. Two complementary tools:
+Two tools for comparing Hyperlight, NanVix (MicroVM), and WSLc.
 
-- **`bench-library`** — Rust binary that links `mxc_engine` directly. Measures steady-state per-invocation latency with runner reuse (no process overhead).
-- **`bench_containments.ps1`** — PowerShell harness that invokes `wxc-exec.exe` as a child process. Measures end-to-end latency including process creation, config parsing, runner construction, and teardown. Also collects per-VM peak working set and on-disk footprint.
+## Tools
 
-## What each mode measures
+**`bench-library`** (Rust) — Links `mxc_engine` directly. Creates runner once, calls `execute()` in a loop. Measures warm-start latency and per-runner memory density.
 
-| Metric | Library mode (`bench-library`) | CLI mode (`bench_containments.ps1`) |
-|--------|-------------------------------|-------------------------------------|
-| **Scope** | `runner.execute()` call only | Full `wxc-exec.exe` process lifetime |
-| **Runner lifecycle** | Created once, reused across iterations | New process → new runner per iteration |
-| **What it isolates** | Per-invocation cost (script execution + VM round-trip) | Cold-start cost (process + config + runner creation + execution) |
-| **Memory** | Process WS via `--density` mode | Peak working set per wxc-exec invocation |
-| **Disk** | Not measured | Snapshot/rootfs/image sizes (sparse-aware for NTFS) |
-| **Density** | `--density N`: N concurrent runners, per-runner MB | Not supported |
+**`bench_containments.ps1`** (PowerShell) — Spawns `wxc-exec.exe` per iteration. Measures cold-start latency, per-process peak WS, and on-disk footprint.
+
+## What each tool measures
+
+| Metric | `bench-library` | `bench_containments.ps1` |
+|--------|-----------------|--------------------------|
+| Latency scope | `runner.execute()` only | Full `wxc-exec.exe` process lifetime |
+| Runner lifecycle | Created once, reused | New process per iteration |
+| Memory | `--density N`: per-runner WS + daemon WS | Peak WS per wxc-exec invocation |
+| Disk | — | Snapshot/rootfs sizes (sparse-aware) |
+
+## Measurement methodology
+
+### Latency
+
+- **Cold-start** (CLI): Wall-clock time of `wxc-exec.exe` process from `Start` to `WaitForExit`. Includes process creation, config parsing, runner construction, VM boot, script execution, teardown. Timed via `System.Diagnostics.Stopwatch`, process launched with raw `ProcessStartInfo` (not `Start-Process`, which adds ~250ms console allocation overhead).
+
+- **Warm-start** (Library): `Instant::now()` around `runner.execute()`. Runner is pre-created and reused. Warmup iterations are discarded.
+
+### Memory (density)
+
+Memory measurement varies by backend architecture:
+
+- **Hyperlight** — VM snapshot is loaded in-process via WHP `WHvMapGpaRange`. Each runner holds ~16.8 MB of snapshot memory persistently. Measured via `K32GetProcessMemoryInfo` on the bench-library process.
+
+- **NanVix** — Each `execute()` spawns `nanvixd.exe` as a short-lived subprocess (~100ms). The VM memory lives in nanvixd, not in bench-library. Measured by polling `nanvixd.exe` WS via `CreateToolhelp32Snapshot` + `K32GetProcessMemoryInfo` during execution. Peak WS ~11 MB per VM.
+
+- **WSLc** — Each `execute()` creates a container via `wslservice.exe` (persistent system service). Measured by capturing wslservice WS delta (peak during execution minus baseline). Per-container delta ~0.2 MB; bench-library client overhead ~1.3 MB/exec.
+
+### Disk footprint
+
+Measured by the PS1 script. Hyperlight uses NTFS sparse files — actual on-disk allocation is measured via `fsutil file layout` (not logical file size).
 
 ## Quick start
 
-### Prerequisites
-
-- Windows with WHP enabled (Hyperlight, NanVix) and/or WSL (WSLc)
-- `wxc-exec.exe` built in release mode: `cargo build --release -p wxc-exec --features hyperlight,microvm,wslc`
-- Hyperlight snapshot set up: `wxc-exec.exe --setup-hyperlight`
-- NanVix daemon running: `nanvixd.exe`
-- For WSLc: a Linux container image available (e.g., `python:3.12-alpine`)
-
-### Library mode
-
 ```powershell
 # Build
-cargo build --release -p bench_library
+cd src
+cargo build --release -p bench_library -p wxc-exec --features hyperlight,microvm,wslc
 
-# Run all backends (20 iterations, 5 warmup)
-.\src\target\release\bench-library.exe --all --iterations 20 --warmup 5
+# Warm-start latency (all backends, 20 iterations)
+.\target\release\bench-library.exe --all --iterations 20 --warmup 5
 
-# Single backend with HTML output
-.\src\target\release\bench-library.exe --backend hyperlight --output-html report.html
+# Density test (8 runners)
+.\target\release\bench-library.exe --density 8 --all
 
-# With custom WSLc image
-.\src\target\release\bench-library.exe --all --wslc-image python:3.12-alpine --output-json results.json
+# Cold-start latency + disk footprint
+.\scripts\bench_containments.ps1 -Backends hyperlight,microvm,wslc -Iterations 10
 
-# Compute workload (~150ms CPU-bound fibonacci instead of trivial hello)
-.\src\target\release\bench-library.exe --all --workload compute --iterations 10
+# Compute workload (~150ms CPU fibonacci instead of hello-world)
+.\target\release\bench-library.exe --all --workload compute --iterations 10
 
-# Density test: create 8 runners simultaneously, measure per-runner memory
-.\src\target\release\bench-library.exe --density 8 --backend hyperlight
-.\src\target\release\bench-library.exe --density 12 --all --output-json density.json
+# JSON output
+.\target\release\bench-library.exe --all --output-json results.json
+.\target\release\bench-library.exe --density 8 --all --output-json density.json
 ```
 
-### CLI mode
+## Adding a backend
 
-```powershell
-# All backends, 10 iterations, JSON + HTML output
-.\scripts\bench_containments.ps1 -Backends hyperlight,microvm,wslc -Iterations 10 `
-    -OutputJson results.json -OutputHtml report.html
-
-# Single backend
-.\scripts\bench_containments.ps1 -Backends hyperlight -Iterations 20
-
-# Skip setup (if snapshot/daemon already ready)
-.\scripts\bench_containments.ps1 -SkipSetup -Iterations 10
-```
-
-## Adding a new backend
-
-### Library mode (`bench-library`)
-
-The binary dispatches via `mxc_engine::resolve_runner()`. To add a backend:
-
-1. Add the CLI string mapping in `main()` (the `--backend` match)
-2. Add a `make_request()` arm to build the correct `ExecutionRequest` (set `containment`, `script_code`, and any experimental config)
-3. Enable the feature in `Cargo.toml` (e.g., `mxc_engine = { ..., features = ["isolation_session"] }`)
-
-The `ContainmentBackend` enum has these variants available on Windows:
-- `ProcessContainer` — default Windows sandbox (AppContainer/BaseContainer)
-- `Hyperlight` — Unikraft unikernel via WHP (experimental)
-- `MicroVm` — NanVix microkernel via WHP (experimental)
-- `Wslc` — Linux container via WSL Container SDK (experimental)
-- `WindowsSandbox` — full Windows Sandbox VM (experimental)
-- `IsolationSession` — IsoEnvBroker session API (experimental, requires `--features isolation_session`)
-
-### CLI mode (`bench_containments.ps1`)
-
-1. Add a workload config JSON file at `tests/bench/workloads/{workload}_{backend}.json`
-2. Add the backend name to the `-Backends` parameter validation
-3. Add any setup logic in the setup section (if the backend needs pre-flight)
-
-## Workloads
-
-| Name | What it does | Guest time | Purpose |
-|------|-------------|------------|---------|
-| `hello` | `print("Hello from...")` | <1 ms | Isolates sandbox overhead |
-| `compute` | `fib(200000)` pure-Python | ~100–200 ms | Shows overhead as fraction of realistic work |
-
-Use `--workload compute` to see how much sandbox overhead matters when the guest is doing real work (matches the ~160ms median tool-call duration from Copilot CLI traces).
-
-## Architecture
-
-```
-bench-library (Rust)
-├── CLI parsing (clap)
-├── make_request(backend, workload) → ExecutionRequest
-├── benchmark_backend()
-│   ├── resolve_runner() → Box<dyn ScriptRunner>  (once)
-│   ├── warmup loop (discarded)
-│   └── timed loop: Instant → runner.execute() → elapsed
-├── density_test()
-│   ├── baseline process WS
-│   ├── create N runners, measure WS after each
-│   ├── execute once on each to force full init
-│   └── report per-runner overhead + "fits in 1.5GB" estimate
-├── compute stats (min/median/mean/p95/max/stdev)
-└── output: JSON (stdout/file) + HTML (file)
-
-bench_containments.ps1 (PowerShell)
-├── Setup (snapshot restore, daemon start)
-├── Invoke-Iteration()
-│   ├── ProcessStartInfo → CreateNoWindow, redirect stdout/stderr
-│   ├── Stopwatch around process lifetime
-│   ├── Poll PeakWorkingSet64 while running
-│   └── Parse restore/call sub-timings from log output
-├── Measure-BackendFootprint()
-│   ├── Hyperlight: fsutil file layout → actual sparse allocation
-│   ├── NanVix: rootfs + initrd + kernel + daemon binary
-│   └── WSLc: OCI image cache size
-├── Compute stats (min/median/mean/p90/p99/max/stdev)
-└── Output: console table + JSON + HTML with Canvas charts
-```
-
-## Output formats
-
-Both tools produce:
-- **JSON** — machine-readable results with per-iteration timings and aggregate stats
-- **HTML** — self-contained report with Canvas charts (strip plot, per-iteration line chart, summary table)
-- **Console** — formatted summary table (PS1 only)
+1. Add the CLI string mapping in `parse_backend()`
+2. Add a `make_request()` arm for the new `ContainmentBackend` variant
+3. If the backend uses an external daemon, add its process name in `daemon_process_names()`
+4. Enable the feature in `Cargo.toml`
