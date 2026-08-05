@@ -15,6 +15,8 @@
 //!   bench-library --backend microvm --iterations 20
 //!   bench-library --backend wslc --iterations 20 --wslc-image python:3.12-alpine
 //!   bench-library --all --iterations 10 --output-json results.json
+//!   bench-library --all --workload compute --iterations 10
+//!   bench-library --density 8 --backend hyperlight
 
 use std::fs;
 use std::time::Instant;
@@ -52,6 +54,11 @@ struct Cli {
     #[arg(long)]
     config: Option<String>,
 
+    /// Workload to run: "hello" (trivial print) or "compute" (~150ms CPU work).
+    /// Ignored when --config is set.
+    #[arg(long, default_value = "hello")]
+    workload: String,
+
     /// WSLc container image (default: python:3.12-alpine).
     #[arg(long, default_value = "python:3.12-alpine")]
     wslc_image: String,
@@ -63,6 +70,11 @@ struct Cli {
     /// Write results as an HTML report.
     #[arg(long)]
     output_html: Option<String>,
+
+    /// Density test: create N runners simultaneously and measure process memory.
+    /// Mutually exclusive with normal benchmark mode.
+    #[arg(long)]
+    density: Option<usize>,
 }
 
 fn parse_backend(s: &str) -> Result<ContainmentBackend, String> {
@@ -83,6 +95,67 @@ fn backend_display_name(b: &ContainmentBackend) -> &'static str {
         ContainmentBackend::Wslc => "WSLc",
         _ => "Unknown",
     }
+}
+
+// ---------------------------------------------------------------------------
+// Process memory measurement (cross-platform, no external crates)
+// ---------------------------------------------------------------------------
+
+/// Returns the current process working set in MB.
+#[cfg(target_os = "windows")]
+fn process_working_set_mb() -> f64 {
+    use std::mem;
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct ProcessMemoryCounters {
+        cb: u32,
+        PageFaultCount: u32,
+        PeakWorkingSetSize: usize,
+        WorkingSetSize: usize,
+        QuotaPeakPagedPoolUsage: usize,
+        QuotaPagedPoolUsage: usize,
+        QuotaPeakNonPagedPoolUsage: usize,
+        QuotaNonPagedPoolUsage: usize,
+        PagefileUsage: usize,
+        PeakPagefileUsage: usize,
+    }
+
+    extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn K32GetProcessMemoryInfo(
+            process: isize,
+            ppsmem_counters: *mut ProcessMemoryCounters,
+            cb: u32,
+        ) -> i32;
+    }
+
+    unsafe {
+        let handle = GetCurrentProcess();
+        let mut counters: ProcessMemoryCounters = mem::zeroed();
+        counters.cb = mem::size_of::<ProcessMemoryCounters>() as u32;
+        if K32GetProcessMemoryInfo(handle, &mut counters, counters.cb) != 0 {
+            counters.WorkingSetSize as f64 / (1024.0 * 1024.0)
+        } else {
+            0.0
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn process_working_set_mb() -> f64 {
+    if let Ok(status) = fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if line.starts_with("VmRSS:") {
+                if let Some(kb_str) = line.split_whitespace().nth(1) {
+                    if let Ok(kb) = kb_str.parse::<f64>() {
+                        return kb / 1024.0;
+                    }
+                }
+            }
+        }
+    }
+    0.0
 }
 
 // ---------------------------------------------------------------------------
@@ -140,14 +213,44 @@ fn compute_stats(times: &[f64]) -> Stats {
 }
 
 // ---------------------------------------------------------------------------
+// Workloads
+// ---------------------------------------------------------------------------
+
+/// Python source for the "hello" workload (trivial, <1ms guest time).
+const HELLO_PY: &str = "import sys, time; t0=time.time(); print(f'Hello from library bench! Python {sys.version}'); print(f'ELAPSED_GUEST_MS={int((time.time()-t0)*1000)}')";
+
+/// Python source for the "compute" workload (~100-200ms CPU-bound).
+/// Fibonacci is a pure-Python CPU benchmark with no dependencies.
+const COMPUTE_PY: &str = r#"import sys, time
+t0 = time.time()
+a, b = 0, 1
+for _ in range(200000):
+    a, b = b, a + b
+elapsed_ms = (time.time() - t0) * 1000
+print(f'fib(200000): {len(str(a))} digits in {elapsed_ms:.0f}ms')
+print(f'ELAPSED_GUEST_MS={int(elapsed_ms)}')"#;
+
+fn workload_py_src(name: &str) -> &'static str {
+    match name {
+        "hello" => HELLO_PY,
+        "compute" => COMPUTE_PY,
+        _ => {
+            eprintln!("Unknown workload '{name}'; expected: hello, compute");
+            std::process::exit(1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Request construction
 // ---------------------------------------------------------------------------
 
-/// Build an ExecutionRequest for the given backend + Python hello-world script.
+/// Build an ExecutionRequest for the given backend + workload.
 fn make_request(
     backend: &ContainmentBackend,
     wslc_image: &str,
     custom_config: Option<&str>,
+    workload: &str,
 ) -> ExecutionRequest {
     if let Some(config_path) = custom_config {
         let json = fs::read_to_string(config_path)
@@ -159,12 +262,12 @@ fn make_request(
         return req;
     }
 
+    let py_src = workload_py_src(workload);
+
     // Hyperlight & NanVix interpret script_code as inline Python source.
     // WSLc interprets it as a shell command line.
-    let py_src = "import sys, time; t0=time.time(); print(f'Hello from library bench! Python {sys.version}'); print(f'ELAPSED_GUEST_MS={int((time.time()-t0)*1000)}')";
-
     let script_code = match backend {
-        ContainmentBackend::Wslc => format!("python3 -c \"{py_src}\""),
+        ContainmentBackend::Wslc => format!("python3 -c \"{}\"", py_src.replace('\n', "; ")),
         _ => py_src.to_string(),
     };
 
@@ -195,6 +298,7 @@ fn make_request(
 #[derive(Debug, Clone, Serialize)]
 struct BackendResult {
     backend: String,
+    workload: String,
     warmup_iterations: usize,
     stats: Stats,
     iterations: Vec<IterationResult>,
@@ -210,14 +314,15 @@ fn benchmark_backend(
     iterations: usize,
     wslc_image: &str,
     custom_config: Option<&str>,
+    workload: &str,
 ) -> BackendResult {
     let name = backend_display_name(backend);
     eprintln!("\n{}", "=".repeat(60));
-    eprintln!("  Benchmarking: {name}");
+    eprintln!("  Benchmarking: {name} (workload: {workload})");
     eprintln!("  Warmup: {warmup}, Iterations: {iterations}");
     eprintln!("{}", "=".repeat(60));
 
-    let request = make_request(backend, wslc_image, custom_config);
+    let request = make_request(backend, wslc_image, custom_config, workload);
 
     // Create the runner once — this is the setup cost we want to amortize
     let t_create = Instant::now();
@@ -229,6 +334,7 @@ fn benchmark_backend(
             eprintln!("  ERROR: {msg}");
             return BackendResult {
                 backend: name.to_string(),
+                workload: workload.to_string(),
                 warmup_iterations: warmup,
                 stats: Stats {
                     count: 0,
@@ -305,12 +411,134 @@ fn benchmark_backend(
 
     BackendResult {
         backend: name.to_string(),
+        workload: workload.to_string(),
         warmup_iterations: warmup,
         stats,
         iterations: results,
         runner_create_ms: Some(create_ms),
         error: None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Density test
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+struct DensityEntry {
+    index: usize,
+    create_ms: f64,
+    execute_ms: f64,
+    exit_code: i32,
+    process_ws_mb: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DensityResult {
+    backend: String,
+    count: usize,
+    entries: Vec<DensityEntry>,
+    baseline_ws_mb: f64,
+    final_ws_mb: f64,
+    per_runner_mb: f64,
+}
+
+fn density_test(
+    n: usize,
+    backends: &[ContainmentBackend],
+    wslc_image: &str,
+    workload: &str,
+) -> Vec<DensityResult> {
+    let mut results = Vec::new();
+
+    for backend in backends {
+        let name = backend_display_name(backend);
+        let request = make_request(backend, wslc_image, None, workload);
+
+        eprintln!("\n{}", "=".repeat(60));
+        eprintln!("  Density test: {name} × {n} runners");
+        eprintln!("{}", "=".repeat(60));
+
+        let baseline_ws = process_working_set_mb();
+        eprintln!("  Baseline process WS: {baseline_ws:.1} MB");
+
+        let mut runners = Vec::with_capacity(n);
+        let mut entries = Vec::with_capacity(n);
+
+        for i in 0..n {
+            // Create runner
+            let t_create = Instant::now();
+            let mut logger = Logger::new(Mode::Buffer);
+            let resolved = match mxc_engine::resolve_runner(&request, &mut logger) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("  [{name}] runner {}/{n} FAILED: {e}", i + 1);
+                    break;
+                }
+            };
+            let create_ms = t_create.elapsed().as_secs_f64() * 1000.0;
+            runners.push(resolved);
+
+            // Execute once to force full initialization
+            let t_exec = Instant::now();
+            let resp = runners
+                .last_mut()
+                .unwrap()
+                .runner
+                .execute(&request, &mut Logger::new(Mode::Buffer));
+            let exec_ms = t_exec.elapsed().as_secs_f64() * 1000.0;
+
+            let ws = process_working_set_mb();
+            eprintln!(
+                "  [{name}] runner {}/{n}: create={create_ms:.1}ms  exec={exec_ms:.1}ms  exit={}  WS={ws:.1}MB",
+                i + 1,
+                resp.exit_code
+            );
+
+            entries.push(DensityEntry {
+                index: i + 1,
+                create_ms,
+                execute_ms: exec_ms,
+                exit_code: resp.exit_code,
+                process_ws_mb: ws,
+            });
+        }
+
+        let final_ws = process_working_set_mb();
+        let alive = runners.len();
+        let per_runner = if alive > 0 {
+            (final_ws - baseline_ws) / alive as f64
+        } else {
+            0.0
+        };
+
+        eprintln!("  [{name}] {alive}/{n} runners alive");
+        eprintln!("  [{name}] Final WS: {final_ws:.1} MB  (baseline: {baseline_ws:.1} MB)");
+        eprintln!(
+            "  [{name}] Per-runner overhead: {per_runner:.1} MB  (total delta: {:.1} MB)",
+            final_ws - baseline_ws
+        );
+
+        // Check against Stuart's target: ≤128 MB per sandbox, ≥12 in 1.5 GB
+        let fits_in_1500mb = ((1500.0 - baseline_ws) / per_runner).floor() as usize;
+        eprintln!(
+            "  [{name}] At {per_runner:.1} MB/runner: ~{fits_in_1500mb} fit in 1.5 GB budget"
+        );
+
+        results.push(DensityResult {
+            backend: name.to_string(),
+            count: alive,
+            entries,
+            baseline_ws_mb: baseline_ws,
+            final_ws_mb: final_ws,
+            per_runner_mb: per_runner,
+        });
+
+        // Drop runners before next backend
+        drop(runners);
+    }
+
+    results
 }
 
 // ---------------------------------------------------------------------------
@@ -525,6 +753,37 @@ fn main() {
         std::process::exit(1);
     };
 
+    // Density test mode
+    if let Some(n) = cli.density {
+        let results = density_test(n, &backends, &cli.wslc_image, &cli.workload);
+
+        // Summary
+        eprintln!("\n{}", "=".repeat(60));
+        eprintln!("  DENSITY SUMMARY");
+        eprintln!("{}", "=".repeat(60));
+        for r in &results {
+            eprintln!(
+                "  {:20} {}/{} runners  per-runner={:.1}MB  total={:.1}MB  (~{} fit in 1.5GB)",
+                r.backend,
+                r.count,
+                n,
+                r.per_runner_mb,
+                r.final_ws_mb - r.baseline_ws_mb,
+                ((1500.0 - r.baseline_ws_mb) / r.per_runner_mb).floor() as usize,
+            );
+        }
+
+        if let Some(path) = &cli.output_json {
+            let json = serde_json::to_string_pretty(&results).expect("serialize");
+            fs::write(path, &json).expect("write JSON");
+            eprintln!("\nJSON written to {path}");
+        }
+
+        println!("{}", serde_json::to_string_pretty(&results).unwrap());
+        return;
+    }
+
+    // Normal benchmark mode
     let custom_config = cli.config.as_deref();
     let mut all_results = Vec::new();
 
@@ -535,13 +794,17 @@ fn main() {
             cli.iterations,
             &cli.wslc_image,
             custom_config,
+            &cli.workload,
         );
         all_results.push(result);
     }
 
     // Summary
     eprintln!("\n{}", "=".repeat(60));
-    eprintln!("  SUMMARY (library-mode, steady-state)");
+    eprintln!(
+        "  SUMMARY (library-mode, steady-state, workload: {})",
+        cli.workload
+    );
     eprintln!("{}", "=".repeat(60));
     for r in &all_results {
         if let Some(err) = &r.error {

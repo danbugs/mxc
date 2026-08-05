@@ -12,8 +12,9 @@ Benchmark suite for comparing MXC containment backends. Two complementary tools:
 | **Scope** | `runner.execute()` call only | Full `wxc-exec.exe` process lifetime |
 | **Runner lifecycle** | Created once, reused across iterations | New process → new runner per iteration |
 | **What it isolates** | Per-invocation cost (script execution + VM round-trip) | Cold-start cost (process + config + runner creation + execution) |
-| **Memory** | Not measured (single process) | Peak working set per wxc-exec invocation |
+| **Memory** | Process WS via `--density` mode | Peak working set per wxc-exec invocation |
 | **Disk** | Not measured | Snapshot/rootfs/image sizes (sparse-aware for NTFS) |
+| **Density** | `--density N`: N concurrent runners, per-runner MB | Not supported |
 
 ## Quick start
 
@@ -39,6 +40,13 @@ cargo build --release -p bench_library
 
 # With custom WSLc image
 .\src\target\release\bench-library.exe --all --wslc-image python:3.12-alpine --output-json results.json
+
+# Compute workload (~150ms CPU-bound fibonacci instead of trivial hello)
+.\src\target\release\bench-library.exe --all --workload compute --iterations 10
+
+# Density test: create 8 runners simultaneously, measure per-runner memory
+.\src\target\release\bench-library.exe --density 8 --backend hyperlight
+.\src\target\release\bench-library.exe --density 12 --all --output-json density.json
 ```
 
 ### CLI mode
@@ -79,16 +87,30 @@ The `ContainmentBackend` enum has these variants available on Windows:
 2. Add the backend name to the `-Backends` parameter validation
 3. Add any setup logic in the setup section (if the backend needs pre-flight)
 
+## Workloads
+
+| Name | What it does | Guest time | Purpose |
+|------|-------------|------------|---------|
+| `hello` | `print("Hello from...")` | <1 ms | Isolates sandbox overhead |
+| `compute` | `fib(200000)` pure-Python | ~100–200 ms | Shows overhead as fraction of realistic work |
+
+Use `--workload compute` to see how much sandbox overhead matters when the guest is doing real work (matches the ~160ms median tool-call duration from Copilot CLI traces).
+
 ## Architecture
 
 ```
 bench-library (Rust)
 ├── CLI parsing (clap)
-├── make_request(backend) → ExecutionRequest
+├── make_request(backend, workload) → ExecutionRequest
 ├── benchmark_backend()
 │   ├── resolve_runner() → Box<dyn ScriptRunner>  (once)
 │   ├── warmup loop (discarded)
 │   └── timed loop: Instant → runner.execute() → elapsed
+├── density_test()
+│   ├── baseline process WS
+│   ├── create N runners, measure WS after each
+│   ├── execute once on each to force full init
+│   └── report per-runner overhead + "fits in 1.5GB" estimate
 ├── compute stats (min/median/mean/p95/max/stdev)
 └── output: JSON (stdout/file) + HTML (file)
 
