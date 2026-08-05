@@ -1,0 +1,21 @@
+[package]
+name = "bench_library"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Library-mode benchmark for MXC containment backends (Hyperlight, NanVix, WSLc)."
+
+[[bin]]
+name = "bench-library"
+path = "src/main.rs"
+
+[dependencies]
+mxc_engine = { path = "../../core/mxc_engine", features = [
+    "hyperlight",
+    "microvm",
+    "wslc",
+] }
+wxc_common = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+clap = { workspace = true, features = ["derive"] }

@@ -183,18 +183,44 @@ function Invoke-Iteration {
     )
 
     $extraArgs = @("--experimental", "--debug")
+    $stdoutFile = [IO.Path]::GetTempFileName()
+    $stderrFile = [IO.Path]::GetTempFileName()
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
-    $prevEAP = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    $output = & $Exe $ConfigPath $extraArgs 2>&1
-    $exitCode = $LASTEXITCODE
-    $ErrorActionPreference = $prevEAP
+    $p = Start-Process -FilePath $Exe -ArgumentList ($ConfigPath + " " + ($extraArgs -join " ")) `
+        -NoNewWindow -PassThru `
+        -RedirectStandardOutput $stdoutFile `
+        -RedirectStandardError $stderrFile
+
+    # Poll for peak working set while process runs
+    $peakWsMB = 0
+    while (-not $p.HasExited) {
+        try {
+            $p.Refresh()
+            $wsMB = [math]::Round($p.PeakWorkingSet64 / 1MB, 2)
+            if ($wsMB -gt $peakWsMB) { $peakWsMB = $wsMB }
+        } catch {}
+        Start-Sleep -Milliseconds 5
+    }
+    # Final read after exit (handle still open from -PassThru)
+    try {
+        $p.Refresh()
+        $wsMB = [math]::Round($p.PeakWorkingSet64 / 1MB, 2)
+        if ($wsMB -gt $peakWsMB) { $peakWsMB = $wsMB }
+    } catch {}
+
+    $p.WaitForExit()
+    $exitCode = $p.ExitCode
+    if ($null -eq $exitCode) { $exitCode = 0 }
 
     $sw.Stop()
 
-    $combined = ($output | Out-String)
+    $combined = ""
+    if (Test-Path $stdoutFile) { $combined += (Get-Content $stdoutFile -Raw) }
+    if (Test-Path $stderrFile) { $combined += (Get-Content $stderrFile -Raw) }
+    Remove-Item $stdoutFile -ErrorAction SilentlyContinue
+    Remove-Item $stderrFile -ErrorAction SilentlyContinue
 
     # Parse restore/call timing from hyperlight/nanvix log lines if present
     $restoreMs = -1
@@ -214,8 +240,100 @@ function Invoke-Iteration {
         RunnerMs   = $runnerMs
         RestoreMs  = $restoreMs
         CallMs     = $callMs
+        PeakMemMB  = $peakWsMB
         Output     = $combined
     }
+}
+
+# --- Memory/disk measurement ---
+
+function Measure-BackendFootprint {
+    param([string]$ExeDir)
+
+    $footprint = @{}
+
+    # Hyperlight snapshot size (actual on-disk allocation, not sparse/apparent)
+    $snapshotDir = Join-Path (Join-Path $env:LOCALAPPDATA "pyhl") "snapshot"
+    if (Test-Path $snapshotDir) {
+        # Use fsutil file layout to get Allocated Size for each file
+        $totalActual = [long]0
+        $totalLogical = [long]0
+        Get-ChildItem $snapshotDir -Recurse -File | ForEach-Object {
+            $totalLogical += $_.Length
+            # Parse 'Allocated Size' from fsutil file layout
+            $layout = & fsutil file layout $_.FullName 2>$null
+            $dataAlloc = $null
+            $inDataStream = $false
+            foreach ($line in ($layout -split "`n")) {
+                $trimmed = $line.Trim()
+                if ($trimmed -match '::[$]DATA$') { $inDataStream = $true }
+                if ($inDataStream -and $trimmed -match '^Allocated Size\s*:\s*([\d,]+)') {
+                    $dataAlloc = [long]($Matches[1] -replace ',','')
+                    break
+                }
+            }
+            if ($null -ne $dataAlloc) {
+                $totalActual += $dataAlloc
+            } else {
+                $totalActual += $_.Length
+            }
+        }
+        $footprint["hyperlight_snapshot"] = @{
+            Path = $snapshotDir
+            ActualSizeMB = [math]::Round($totalActual / 1MB, 2)
+            LogicalSizeMB = [math]::Round($totalLogical / 1MB, 2)
+            FileCount = (Get-ChildItem $snapshotDir -Recurse -File).Count
+        }
+    }
+
+    # NanVix files (next to wxc-exec)
+    $nanvixFiles = @("nanvixd.exe", "nanvix_rootfs.img", "python3.initrd")
+    $nanvixTotal = 0
+    $nanvixDetail = @{}
+    foreach ($f in $nanvixFiles) {
+        $fp = Join-Path $ExeDir $f
+        if (Test-Path $fp) {
+            $sz = (Get-Item $fp).Length
+            $nanvixTotal += $sz
+            $nanvixDetail[$f] = [math]::Round($sz / 1MB, 2)
+        }
+    }
+    $kernelPath = Join-Path (Join-Path $ExeDir "bin") "kernel.elf"
+    if (Test-Path $kernelPath) {
+        $sz = (Get-Item $kernelPath).Length
+        $nanvixTotal += $sz
+        $nanvixDetail["bin/kernel.elf"] = [math]::Round($sz / 1MB, 2)
+    }
+    if ($nanvixTotal -gt 0) {
+        $footprint["nanvix_files"] = @{
+            TotalMB = [math]::Round($nanvixTotal / 1MB, 2)
+            Files = $nanvixDetail
+        }
+    }
+
+    # NanVix daemon memory (if running)
+    $nanvixd = Get-Process nanvixd -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($nanvixd) {
+        $footprint["nanvixd_daemon"] = @{
+            PID = $nanvixd.Id
+            WorkingSetMB = [math]::Round($nanvixd.WorkingSet64 / 1MB, 2)
+            PeakWorkingSetMB = [math]::Round($nanvixd.PeakWorkingSet64 / 1MB, 2)
+        }
+    }
+
+    # WSLc image cache size
+    $wslcCache = Join-Path $env:TEMP "mxc-wslc-sessions"
+    if (Test-Path $wslcCache) {
+        $cacheMeasure = Get-ChildItem $wslcCache -Recurse -File | Measure-Object -Property Length -Sum
+        $cacheSize = if ($cacheMeasure.Sum) { $cacheMeasure.Sum } else { 0 }
+        $footprint["wslc_cache"] = @{
+            Path = $wslcCache
+            SizeMB = [math]::Round($cacheSize / 1MB, 2)
+            FileCount = if ($cacheMeasure.Count) { $cacheMeasure.Count } else { 0 }
+        }
+    }
+
+    return $footprint
 }
 
 # --- Statistics ---
@@ -316,6 +434,7 @@ foreach ($backend in $selectedBackends) {
     $timings = @()
     $callTimings = @()
     $restoreTimings = @()
+    $memoryMBs = @()
     $failures = 0
     $totalRuns = $WarmupIterations + $Iterations
 
@@ -343,10 +462,16 @@ foreach ($backend in $selectedBackends) {
         if ($result.RestoreMs -ge 0) {
             $detail += " restore=$([math]::Round($result.RestoreMs,1))ms call=$([math]::Round($result.CallMs,1))ms"
         }
+        if ($result.PeakMemMB -gt 0) {
+            $detail += " mem=$([math]::Round($result.PeakMemMB,1))MB"
+        }
         Write-Host "$([math]::Round($result.ElapsedMs, 1)) ms$detail | $status" -ForegroundColor $color
 
         if (-not $isWarmup) {
             $timings += $result.ElapsedMs
+            if ($result.PeakMemMB -gt 0) {
+                $memoryMBs += $result.PeakMemMB
+            }
             if ($result.CallMs -ge 0) {
                 $callTimings += $result.CallMs
             }
@@ -359,6 +484,7 @@ foreach ($backend in $selectedBackends) {
     $stats = Get-Stats $timings
     $callStats = if ($callTimings.Count -gt 0) { Get-Stats $callTimings } else { $null }
     $restoreStats = if ($restoreTimings.Count -gt 0) { Get-Stats $restoreTimings } else { $null }
+    $memStats = if ($memoryMBs.Count -gt 0) { Get-Stats $memoryMBs } else { $null }
 
     $allResults[$backend] = @{
         Backend        = $backend
@@ -368,9 +494,15 @@ foreach ($backend in $selectedBackends) {
         TimingMs       = $stats
         CallMs         = $callStats
         RestoreMs      = $restoreStats
+        MemoryMB       = $memStats
         RawTimings     = $timings
     }
 }
+
+# --- Memory footprint ---
+
+Write-Host "`n=== Measuring disk/memory footprint ===" -ForegroundColor Yellow
+$footprint = Measure-BackendFootprint -ExeDir $exeDir
 
 # --- Summary ---
 
@@ -414,6 +546,47 @@ if ($allResults.Values | Where-Object { $_.CallMs }) {
     }
 }
 
+if ($allResults.Values | Where-Object { $_.MemoryMB }) {
+    Write-Host ""
+    Write-Host "  Peak process memory (wxc-exec WorkingSet):" -ForegroundColor White
+    $memHeader = "{0,-15} {1,10} {2,10} {3,10} {4,10}" -f `
+        "Backend", "Min(MB)", "Median", "Mean", "Max(MB)"
+    Write-Host $memHeader -ForegroundColor White
+    Write-Host ("-" * 60)
+    foreach ($backend in $selectedBackends) {
+        if (-not $allResults.ContainsKey($backend)) { continue }
+        $m = $allResults[$backend].MemoryMB
+        if ($m) {
+            $row = "{0,-15} {1,10} {2,10} {3,10} {4,10}" -f `
+                $backend, $m.Min, $m.Median, $m.Mean, $m.Max
+            Write-Host $row
+        }
+    }
+}
+
+Write-Host ""
+Write-Host "  Disk/daemon footprint:" -ForegroundColor White
+Write-Host ("-" * 60)
+if ($footprint.ContainsKey("hyperlight_snapshot")) {
+    $hs = $footprint["hyperlight_snapshot"]
+    Write-Host "  Hyperlight snapshot:  $($hs.ActualSizeMB) MB on disk ($($hs.LogicalSizeMB) MB logical, $($hs.FileCount) files)"
+}
+if ($footprint.ContainsKey("nanvix_files")) {
+    $nf = $footprint["nanvix_files"]
+    Write-Host "  NanVix files:         $($nf.TotalMB) MB total"
+    foreach ($fname in $nf.Files.Keys | Sort-Object) {
+        Write-Host "    $fname = $($nf.Files[$fname]) MB"
+    }
+}
+if ($footprint.ContainsKey("nanvixd_daemon")) {
+    $nd = $footprint["nanvixd_daemon"]
+    Write-Host "  nanvixd daemon (PID $($nd.PID)):  WS=$($nd.WorkingSetMB) MB  Peak=$($nd.PeakWorkingSetMB) MB"
+}
+if ($footprint.ContainsKey("wslc_cache")) {
+    $wc = $footprint["wslc_cache"]
+    Write-Host "  WSLc image cache:     $($wc.SizeMB) MB ($($wc.FileCount) files) at $($wc.Path)"
+}
+
 Write-Host ""
 
 # --- JSON output ---
@@ -437,9 +610,11 @@ if ($OutputJson -ne "") {
             timingMs     = $r.TimingMs
             callMs       = $r.CallMs
             restoreMs    = $r.RestoreMs
+            memoryMB     = $r.MemoryMB
             rawTimingsMs = $r.RawTimings
         }
     }
+    $jsonObj.footprint = $footprint
     $jsonObj | ConvertTo-Json -Depth 5 | Set-Content -Path $OutputJson -Encoding UTF8
     Write-Host "Results written to: $OutputJson" -ForegroundColor Green
 }
@@ -481,9 +656,33 @@ if ($OutputHtml -ne "" -and $allResults.Count -gt 0) {
             $rs = $r.RestoreMs
             $jsData += ", restore: { min: $($rs.Min), median: $($rs.Median), mean: $($rs.Mean), p90: $($rs.P90), max: $($rs.Max) }"
         }
+        if ($r.MemoryMB) {
+            $m = $r.MemoryMB
+            $jsData += ", memory: { min: $($m.Min), median: $($m.Median), mean: $($m.Mean), max: $($m.Max) }"
+        }
         $jsData += " },"
     }
     $jsData += "`n    }"
+
+    # Build footprint JS data
+    $jsFootprint = "{"
+    if ($footprint.ContainsKey("hyperlight_snapshot")) {
+        $hs = $footprint["hyperlight_snapshot"]
+        $jsFootprint += " hyperlight: { actualMB: $($hs.ActualSizeMB), logicalMB: $($hs.LogicalSizeMB), files: $($hs.FileCount) },"
+    }
+    if ($footprint.ContainsKey("nanvix_files")) {
+        $nf = $footprint["nanvix_files"]
+        $jsFootprint += " nanvix: { sizeMB: $($nf.TotalMB) },"
+    }
+    if ($footprint.ContainsKey("nanvixd_daemon")) {
+        $nd = $footprint["nanvixd_daemon"]
+        $jsFootprint += " nanvixd: { wsMB: $($nd.WorkingSetMB), peakMB: $($nd.PeakWorkingSetMB) },"
+    }
+    if ($footprint.ContainsKey("wslc_cache")) {
+        $wc = $footprint["wslc_cache"]
+        $jsFootprint += " wslc: { sizeMB: $($wc.SizeMB), files: $($wc.FileCount) },"
+    }
+    $jsFootprint += " }"
 
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm"
     $hostname = $env:COMPUTERNAME
@@ -552,10 +751,15 @@ if ($OutputHtml -ne "" -and $allResults.Count -gt 0) {
     <div style="padding:.85rem 1rem .5rem; font-size:.78rem; font-weight:600; color:var(--text2);">Summary (ms)</div>
     <div class="tbl-wrap"><table id="stats"></table></div>
   </div>
+  <div class="section" style="padding:0; overflow:hidden;">
+    <div style="padding:.85rem 1rem .5rem; font-size:.78rem; font-weight:600; color:var(--text2);">Memory &amp; Disk Footprint</div>
+    <div class="tbl-wrap"><table id="footprintTbl"></table></div>
+  </div>
   <footer>wxc-exec release build &middot; WHP snapshots</footer>
 </div>
 <script>
 const D = $jsData;
+const FP = $jsFootprint;
 const BACKENDS = Object.keys(D);
 function css(p) { return getComputedStyle(document.documentElement).getPropertyValue(p).trim(); }
 
@@ -571,17 +775,6 @@ function css(p) { return getComputedStyle(document.documentElement).getPropertyV
       + '<div class="card-note">median wall-clock' + (d.failures > 0 ? ' &middot; ' + d.failures + ' failures' : '') + '</div>';
     el.appendChild(card);
   });
-  if (BACKENDS.length >= 2) {
-    const vals = BACKENDS.map(k => D[k].median).sort((a,b) => a - b);
-    const ratio = (vals[vals.length - 1] / vals[0]).toFixed(1);
-    const fastest = BACKENDS.reduce((a, b) => D[a].median < D[b].median ? a : b);
-    const card = document.createElement('div');
-    card.className = 'card';
-    card.innerHTML = '<div class="card-label">Spread</div>'
-      + '<div class="card-val">' + ratio + '<span style="font-size:.7rem;opacity:.7">x</span></div>'
-      + '<div class="card-note">' + D[fastest].label + ' fastest</div>';
-    el.appendChild(card);
-  }
 })();
 
 function setupCanvas(id) {
@@ -714,15 +907,31 @@ function drawLine() {
     h += '<td>' + d.p90 + '</td><td>' + d.p99 + '</td><td>' + d.max + '</td>';
     h += '<td>' + d.stddev + '</td><td>' + d.failures + '</td></tr>';
   });
-  if (BACKENDS.length >= 2) {
-    const fastest = BACKENDS.reduce((a, b) => D[a].median < D[b].median ? a : b);
-    const slowest = BACKENDS.reduce((a, b) => D[a].median > D[b].median ? a : b);
-    if (fastest !== slowest) {
-      const delta = (D[slowest].median - D[fastest].median).toFixed(2);
-      h += '<tr><td style="font-weight:400;color:' + css('--text2') + '">Delta (fastest&rarr;slowest)</td>';
-      h += '<td></td><td style="color:#1B9E6D;font-weight:600">+' + delta + '</td><td></td><td></td><td></td><td></td><td></td><td></td></tr>';
-    }
+  // Add memory column if any backend has it
+  const hasMemory = BACKENDS.some(k => D[k].memory);
+  if (hasMemory) {
+    h += '<tr><td colspan="9" style="font-weight:600;font-family:var(--sans);padding-top:1rem;">Peak Process Memory (MB)</td></tr>';
+    BACKENDS.forEach(k => {
+      const d = D[k];
+      if (d.memory) {
+        h += '<tr><td style="color:' + d.color + '">' + d.label + '</td>';
+        h += '<td>' + d.memory.min + '</td><td>' + d.memory.median + '</td><td>' + d.memory.mean + '</td>';
+        h += '<td></td><td></td><td>' + d.memory.max + '</td><td></td><td></td></tr>';
+      }
+    });
   }
+  h += '</tbody>';
+  tbl.innerHTML = h;
+})();
+
+// Footprint table
+(function() {
+  const tbl = document.getElementById('footprintTbl');
+  let h = '<thead><tr><th>Component</th><th>Size (MB)</th><th>Detail</th></tr></thead><tbody>';
+  if (FP.hyperlight) h += '<tr><td>Hyperlight snapshot</td><td>' + FP.hyperlight.actualMB + '</td><td>on disk (' + FP.hyperlight.logicalMB + ' MB logical, ' + FP.hyperlight.files + ' files, sparse)</td></tr>';
+  if (FP.nanvix) h += '<tr><td>NanVix files</td><td>' + FP.nanvix.sizeMB + '</td><td>rootfs + initrd + kernel + daemon</td></tr>';
+  if (FP.nanvixd) h += '<tr><td>nanvixd daemon (live)</td><td>' + FP.nanvixd.wsMB + '</td><td>working set (peak ' + FP.nanvixd.peakMB + ' MB)</td></tr>';
+  if (FP.wslc) h += '<tr><td>WSLc image cache</td><td>' + FP.wslc.sizeMB + '</td><td>' + FP.wslc.files + ' files</td></tr>';
   h += '</tbody>';
   tbl.innerHTML = h;
 })();

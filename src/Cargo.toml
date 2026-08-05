@@ -37,6 +37,7 @@ members = [
     "testing/wxc_ui_probe",
     "tools/mxc_diagnostic_console",
     "tools/mxc_schema_gen",
+    "testing/bench_library",
     "ffi/mxc_ffi",
     "mxc_telemetry",
 ]
