@@ -38,7 +38,7 @@ We measure **memory commit** (`PagefileUsage` from `PROCESS_MEMORY_COUNTERS`) ra
 
 - **Hyperlight** — OCI snapshot at `%LOCALAPPDATA%\pyhl\snapshot\` (sparse-aware). Installed by `wxc-exec --setup-hyperlight`.
 - **NanVix** — `nanvixd.exe`, `nanvix_rootfs.img`, `python3.initrd`, `kernel.elf` next to `wxc-exec.exe`.
-- **WSLc** — OCI images stored inside shared WSL2 ext4.vhdx. Per-image size not measurable from host.
+- **WSLc** — OCI images stored inside shared WSL2 ext4.vhdx. Measured by creating a temporary container and running `du -sx /` to capture the unpacked image rootfs size.
 
 ## Individual benchmarks
 

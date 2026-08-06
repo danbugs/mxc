@@ -1395,7 +1395,7 @@ fn measure_dir_recursive(dir: &std::path::Path) -> Vec<DiskFile> {
     files
 }
 
-fn measure_disk(backend: &ContainmentBackend) -> DiskResult {
+fn measure_disk(backend: &ContainmentBackend, wslc_image: &str) -> DiskResult {
     let name = backend_display_name(backend);
     let exe_dir = std::env::current_exe()
         .expect("current_exe")
@@ -1447,12 +1447,66 @@ fn measure_disk(backend: &ContainmentBackend) -> DiskResult {
             DiskResult { backend: name.to_string(), total_mb: total, files, note: None }
         }
         ContainmentBackend::Wslc => {
-            // WSLc OCI images are stored inside a shared WSL2 ext4.vhdx — not
-            // attributable to a single container image from the host side.
-            eprintln!("  [WSLc] disk: OCI images inside shared WSL2 VHDX, not measurable per-image");
-            DiskResult {
-                backend: name.to_string(), total_mb: 0.0, files: vec![],
-                note: Some("OCI images stored inside shared WSL2 ext4.vhdx — per-image size not measurable from host".into()),
+            // Measure the OCI image rootfs from inside a WSLc container using du.
+            // The image is stored inside WSL2's shared ext4.vhdx and can't be
+            // attributed per-image from the host side, but we can measure its
+            // unpacked rootfs size from within.
+            eprintln!("  [WSLc] disk: measuring image rootfs from inside container...");
+
+            let mut req = ExecutionRequest {
+                schema_version: "0.8.0".to_string(),
+                container_id: "bench-disk-wslc".to_string(),
+                script_code: "du -sx / 2>/dev/null | head -1".to_string(),
+                script_timeout: 30000,
+                containment: ContainmentBackend::Wslc,
+                experimental_enabled: true,
+                ..Default::default()
+            };
+            req.experimental.wslc = Some(wxc_common::models::WslcConfig {
+                image: wslc_image.to_string(),
+                ..Default::default()
+            });
+
+            let mut logger = Logger::new(Mode::Buffer);
+            match mxc_engine::resolve_runner(&req, &mut logger) {
+                Ok(resolved) => {
+                    let mut runner = resolved.runner;
+                    let resp = runner.execute(&req, &mut Logger::new(Mode::Buffer));
+
+                    // Parse du output: "51200\t/" means 51200 KB = 50 MB
+                    let total_mb = resp.standard_out.lines().next().and_then(|line| {
+                        let kb_str = line.split_whitespace().next()?;
+                        let kb: f64 = kb_str.parse().ok()?;
+                        Some(kb / 1024.0)
+                    }).unwrap_or(0.0);
+
+                    if total_mb > 0.0 {
+                        eprintln!("  [WSLc] disk: {total_mb:.1} MB (image rootfs via du)");
+                        DiskResult {
+                            backend: name.to_string(),
+                            total_mb,
+                            files: vec![DiskFile {
+                                name: format!("{wslc_image} (rootfs)"),
+                                logical_mb: total_mb,
+                                actual_mb: total_mb,
+                            }],
+                            note: Some("measured from inside container via du -sx /".into()),
+                        }
+                    } else {
+                        eprintln!("  [WSLc] disk: du failed, stdout={:?}", resp.standard_out);
+                        DiskResult {
+                            backend: name.to_string(), total_mb: 0.0, files: vec![],
+                            note: Some("could not measure image rootfs from inside container".into()),
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  [WSLc] disk: failed to create runner: {e}");
+                    DiskResult {
+                        backend: name.to_string(), total_mb: 0.0, files: vec![],
+                        note: Some(format!("failed to create runner for disk measurement: {e}")),
+                    }
+                }
             }
         }
         _ => DiskResult { backend: name.to_string(), total_mb: 0.0, files: vec![], note: None },
@@ -1896,22 +1950,23 @@ function drawLatencyChart(canvas, datasets) {{
     }})]);
   }}
 
-  // Parallel throughput (take from first workload)
-  if (D.workloads.length && D.workloads[0].parallel && D.workloads[0].parallel.length) {{
-    const wl0 = D.workloads[0];
-    const conc = wl0.parallel[0] ? wl0.parallel[0].concurrency : '?';
-    sRows.push(['Parallel throughput (' + conc + '×)', ...allBackends.map(b => {{
-      const r = wl0.parallel.find(p => p.backend === b);
-      if (!r || r.error) return '—';
-      return r.throughput_per_sec.toFixed(0) + ' exec/s';
-    }})]);
-  }}
+  // Parallel throughput (per-workload rows, matching warm/cold pattern)
+  D.workloads.forEach(wl => {{
+    if (wl.parallel && wl.parallel.length) {{
+      const conc = wl.parallel[0] ? wl.parallel[0].concurrency : '?';
+      sRows.push([wl.workload + ' parallel (' + conc + '×, exec/s)', ...allBackends.map(b => {{
+        const r = wl.parallel.find(p => p.backend === b);
+        if (!r || r.error) return '—';
+        return r.throughput_per_sec.toFixed(0);
+      }})]);
+    }}
+  }});
 
   // Disk
   sRows.push(['Disk footprint (MB)', ...allBackends.map(b => {{
     const r = D.disk.find(d => d.backend === b);
     if (!r) return '—';
-    if (r.total_mb > 0) return fmt(r.total_mb);
+    if (r.total_mb > 0) return r.note ? fmt(r.total_mb) + ' *' : fmt(r.total_mb);
     return r.note ? 'N/A *' : '—';
   }})]);
 
@@ -2158,7 +2213,7 @@ fn main() {
         }
 
         // 4. Disk (workload-independent, run once)
-        let disk: Vec<DiskResult> = backends.iter().map(|b| measure_disk(b)).collect();
+        let disk: Vec<DiskResult> = backends.iter().map(|b| measure_disk(b, &cli.wslc_image)).collect();
 
         let result = FullResult { workloads: workload_results, disk };
 
