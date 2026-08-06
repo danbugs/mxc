@@ -281,6 +281,38 @@ mod mem_win {
         }
     }
 
+    /// Returns system-wide commit charge used (MB) via GlobalMemoryStatusEx.
+    /// Captures ALL memory including VM memory (vmmem) that per-process APIs can't see.
+    pub fn system_commit_used_mb() -> f64 {
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct MEMORYSTATUSEX {
+            dwLength: u32,
+            dwMemoryLoad: u32,
+            ullTotalPhys: u64,
+            ullAvailPhys: u64,
+            ullTotalPageFile: u64,
+            ullAvailPageFile: u64,
+            ullTotalVirtual: u64,
+            ullAvailVirtual: u64,
+            ullAvailExtendedVirtual: u64,
+        }
+
+        extern "system" {
+            fn GlobalMemoryStatusEx(lpBuffer: *mut MEMORYSTATUSEX) -> i32;
+        }
+
+        unsafe {
+            let mut status: MEMORYSTATUSEX = mem::zeroed();
+            status.dwLength = mem::size_of::<MEMORYSTATUSEX>() as u32;
+            if GlobalMemoryStatusEx(&mut status) != 0 {
+                (status.ullTotalPageFile - status.ullAvailPageFile) as f64 / (1024.0 * 1024.0)
+            } else {
+                0.0
+            }
+        }
+    }
+
     /// Returns the actual on-disk allocation of a file (handles NTFS sparse/compressed).
     pub fn file_actual_size_mb(path: &std::path::Path) -> f64 {
         use std::os::windows::ffi::OsStrExt;
@@ -304,6 +336,7 @@ mod mem_win {
 use mem_win::{
     external_process_commit_mb, file_actual_size_mb,
     process_commit_mb, process_peak_commit_by_handle,
+    system_commit_used_mb,
 };
 
 #[cfg(not(target_os = "windows"))]
@@ -330,6 +363,11 @@ fn external_process_commit_mb(_target_names: &[&str]) -> f64 {
 
 #[cfg(not(target_os = "windows"))]
 fn process_peak_commit_by_handle(_handle: isize) -> f64 {
+    0.0
+}
+
+#[cfg(not(target_os = "windows"))]
+fn system_commit_used_mb() -> f64 {
     0.0
 }
 
@@ -625,6 +663,8 @@ struct DensityEntry {
     /// Peak external daemon commit during execute (captures nanvixd subprocess).
     #[serde(skip_serializing_if = "Option::is_none")]
     peak_daemon_commit_mb: Option<f64>,
+    /// System-wide commit used after this runner's execute (GlobalMemoryStatusEx).
+    system_commit_mb: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -636,10 +676,15 @@ struct DensityResult {
     entries: Vec<DensityEntry>,
     baseline_commit_mb: f64,
     final_commit_mb: f64,
+    /// System-wide commit baseline (captures VM memory invisible to per-process APIs).
+    baseline_system_commit_mb: f64,
+    final_system_commit_mb: f64,
     /// Persistent per-runner overhead (commit that stays after execute).
     per_runner_persistent_mb: f64,
     /// Peak per-execution overhead (commit during execute, includes ephemeral VM).
     per_exec_peak_mb: f64,
+    /// Per-runner system-wide commit delta (includes VM memory for WSLc).
+    per_runner_system_mb: f64,
     /// External daemon memory growth.
     #[serde(skip_serializing_if = "Option::is_none")]
     daemon_names: Option<Vec<String>>,
@@ -651,7 +696,8 @@ struct DensityResult {
     per_runner_daemon_mb: Option<f64>,
     /// The cost used for density estimation:
     /// - Persistent backends (Hyperlight): persistent per-runner + daemon
-    /// - Ephemeral backends (NanVix/WSLc): peak per-execution + daemon
+    /// - Ephemeral backends (NanVix): peak per-execution + daemon
+    /// - WSLc: system-wide commit delta (captures VM memory)
     density_cost_mb: f64,
     fits_in_1500mb: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -732,6 +778,7 @@ fn density_test(
         eprintln!("{}", "=".repeat(60));
 
         let baseline_commit = process_commit_mb();
+        let baseline_system_commit = system_commit_used_mb();
         let baseline_daemon_commit = if has_daemon {
             let dc = external_process_commit_mb(&dnames);
             eprintln!("  Baseline daemon commit: {dc:.1} MB");
@@ -740,6 +787,7 @@ fn density_test(
             None
         };
         eprintln!("  Baseline process commit: {baseline_commit:.1} MB");
+        eprintln!("  Baseline system commit:  {baseline_system_commit:.0} MB");
 
         let mut runners = Vec::with_capacity(n);
         let mut entries = Vec::with_capacity(n);
@@ -767,20 +815,14 @@ fn density_test(
             );
 
             let commit = process_commit_mb();
+            let sys_commit = system_commit_used_mb();
 
-            if has_daemon {
-                eprintln!(
-                    "  [{name}] runner {}/{n}: create={create_ms:.1}ms  exec={exec_ms:.1}ms  exit={}  commit={commit:.1}MB  peakCommit={peak_commit:.1}MB  peakDaemon={peak_dc:.1}MB",
-                    i + 1,
-                    resp.exit_code,
-                );
-            } else {
-                eprintln!(
-                    "  [{name}] runner {}/{n}: create={create_ms:.1}ms  exec={exec_ms:.1}ms  exit={}  commit={commit:.1}MB  peakCommit={peak_commit:.1}MB",
-                    i + 1,
-                    resp.exit_code,
-                );
-            }
+            eprintln!(
+                "  [{name}] runner {}/{n}: create={create_ms:.1}ms  exec={exec_ms:.1}ms  exit={}  commit={commit:.1}MB  peakCommit={peak_commit:.1}MB  sysCommit={sys_commit:.0}MB{}",
+                i + 1,
+                resp.exit_code,
+                if has_daemon { format!("  peakDaemon={peak_dc:.1}MB") } else { String::new() },
+            );
 
             entries.push(DensityEntry {
                 index: i + 1,
@@ -790,10 +832,12 @@ fn density_test(
                 process_commit_mb: commit,
                 peak_commit_during_exec_mb: peak_commit,
                 peak_daemon_commit_mb: if has_daemon { Some(peak_dc) } else { None },
+                system_commit_mb: sys_commit,
             });
         }
 
         let final_commit = process_commit_mb();
+        let final_system_commit = system_commit_used_mb();
         let final_daemon_commit = if has_daemon {
             Some(external_process_commit_mb(&dnames))
         } else {
@@ -803,6 +847,14 @@ fn density_test(
         let alive = runners.len();
         let per_runner_persistent = if alive > 0 {
             (final_commit - baseline_commit) / alive as f64
+        } else {
+            0.0
+        };
+
+        // System-wide commit delta per runner — captures VM memory (vmmem) that
+        // per-process APIs can't see. Used for WSLc density estimation.
+        let per_runner_system = if alive > 0 {
+            (final_system_commit - baseline_system_commit) / alive as f64
         } else {
             0.0
         };
@@ -847,12 +899,17 @@ fn density_test(
             None
         };
 
-        // Choose the right cost metric for density estimation
-        let density_cost = if ephemeral {
-            // Ephemeral: per-execution peak (process commit) + daemon subprocess cost
+        // Choose the right cost metric for density estimation:
+        // - Hyperlight (persistent): per-runner commit + daemon
+        // - NanVix (ephemeral): per-execution peak + daemon (nanvixd subprocess commit)
+        // - WSLc (ephemeral, VM-hosted): system-wide commit delta
+        //   (captures container memory in WSL2 VM invisible to per-process APIs)
+        let density_cost = if matches!(backend, ContainmentBackend::Wslc) {
+            // System-wide delta is the only way to capture WSL2 VM memory
+            per_runner_system.max(0.0)
+        } else if ephemeral {
             per_exec_peak + per_runner_daemon.unwrap_or(0.0)
         } else {
-            // Persistent: per-runner commit (snapshot stays in memory) + daemon
             per_runner_persistent + per_runner_daemon.unwrap_or(0.0)
         };
 
@@ -869,6 +926,9 @@ fn density_test(
         eprintln!(
             "  [{name}] Peak per-execution:    {per_exec_peak:.1} MB"
         );
+        eprintln!(
+            "  [{name}] System commit delta:   {per_runner_system:.1} MB/runner"
+        );
         if let (Some(d), Some(b)) = (per_runner_daemon, baseline_daemon_commit) {
             let label = if b < 0.1 { "subprocess" } else { "service delta" };
             eprintln!(
@@ -879,12 +939,8 @@ fn density_test(
             "  [{name}] => Density cost: {density_cost:.1} MB/runner  (~{fits} fit in 1.5 GB)"
         );
 
-        // WSLc containers run inside a WSL2 lightweight VM — the actual container
-        // memory (Linux kernel, Python runtime) lives in the VM's address space and
-        // is not visible in any Windows process's commit charge. The numbers here
-        // capture only the Windows-side IPC/handle overhead.
         let note = if matches!(backend, ContainmentBackend::Wslc) {
-            Some("Windows-side overhead only — container memory lives in WSL2 VM, not visible in host process commit".into())
+            Some("Measured via system-wide commit delta (container memory in WSL2 VM)".into())
         } else {
             None
         };
@@ -896,8 +952,11 @@ fn density_test(
             entries,
             baseline_commit_mb: baseline_commit,
             final_commit_mb: final_commit,
+            baseline_system_commit_mb: baseline_system_commit,
+            final_system_commit_mb: final_system_commit,
             per_runner_persistent_mb: per_runner_persistent,
             per_exec_peak_mb: per_exec_peak,
+            per_runner_system_mb: per_runner_system,
             daemon_names: if has_daemon {
                 Some(dnames.iter().map(|s| s.to_string()).collect())
             } else {
