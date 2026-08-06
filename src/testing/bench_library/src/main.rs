@@ -3,11 +3,12 @@
 
 //! Library-mode benchmark for MXC containment backends.
 //!
-//! Measures steady-state per-invocation latency (runner reuse, no process
-//! overhead), per-runner memory density (commit charge), and concurrent
-//! execution throughput. For daemon-backed backends (NanVix, WSLc) where
-//! VM/container memory is ephemeral or lives in external processes, we measure
-//! peak memory commit during execution to capture the true per-VM cost.
+//! Measures steady-state per-invocation latency, per-runner memory density,
+//! parallel throughput, and disk footprint. Each backend has a different
+//! memory architecture, so density is measured where the memory actually lives:
+//!   - Hyperlight: in-process commit (VM snapshot mapped via WHP)
+//!   - NanVix:     subprocess commit (nanvixd holds the full VM address space)
+//!   - WSLc:       cgroup memory from inside the container (in the WSL2 VM)
 //!
 //! Usage:
 //!   bench-library --backend hyperlight --iterations 20 --warmup 3
@@ -945,10 +946,23 @@ fn density_test(
             None
         };
 
-        // Choose the right cost metric for density estimation:
-        // - Hyperlight (persistent): per-runner commit + daemon
-        // - NanVix (ephemeral): per-execution peak + daemon (nanvixd subprocess commit)
-        // - WSLc: cgroup memory from inside container (actual in-VM usage per container)
+        // Each backend has a different memory architecture, so we measure
+        // where the VM/container memory actually lives:
+        //
+        // - Hyperlight (persistent, in-process): VM snapshot loaded into the
+        //   bench-library process via WHP WHvMapGpaRange. The per-process
+        //   commit growth captures the user-space mapping cost per runner.
+        //
+        // - NanVix (ephemeral, subprocess): each execute() spawns nanvixd.exe
+        //   which commits the full VM address space (~258 MB). The subprocess
+        //   is short-lived — memory is freed after each call. We capture its
+        //   peak commit by polling during execution.
+        //
+        // - WSLc (ephemeral, VM-hosted): each execute() creates a container
+        //   inside the shared WSL2 VM. Container memory is invisible to host
+        //   process APIs (it lives in the vmmem kernel pseudo-process). We
+        //   measure from inside the container via Linux cgroup stats
+        //   (/sys/fs/cgroup/memory.current).
         let density_cost = if is_wslc {
             per_container_memory.unwrap_or(per_runner_system.max(0.0))
         } else if ephemeral {

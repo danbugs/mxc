@@ -22,17 +22,17 @@ cargo build --release -p bench_library -p wxc-exec --features hyperlight,microvm
 | **Parallel throughput** | Creates N concurrent runners (default 5), synchronizes via barrier, executes workload simultaneously. Measures wall-clock time, per-runner latency under contention, and throughput (exec/sec). |
 | **Disk footprint** | Measures runtime files. Sparse-aware via `GetCompressedFileSizeW`. |
 
-### Memory measurement: commit charge vs working set
+### Why each backend is measured differently
 
-We measure **memory commit** (`PagefileUsage` from `PROCESS_MEMORY_COUNTERS`) rather than working set. Commit charge represents virtual memory backed by physical RAM or pagefile — it's stable across memory pressure changes (unlike WS, which the OS can trim). This gives more accurate density estimates, especially for WSLc where container memory lives in the WSL2 VM.
+Each backend has a different memory architecture, so we measure where the VM/container memory actually lives:
 
-### Memory model per backend
+- **Hyperlight** — VM snapshot loaded in-process via WHP `WHvMapGpaRange`. Each runner's memory lives in the bench-library process. Measured via per-process commit charge (`K32GetProcessMemoryInfo` → `PagefileUsage`).
 
-- **Hyperlight** — VM snapshot loaded in-process via WHP `WHvMapGpaRange`. Each runner holds ~16.8 MB persistently. Measured via `K32GetProcessMemoryInfo` commit charge on the bench-library process.
+- **NanVix** — Each `execute()` spawns `nanvixd.exe` as a short-lived subprocess. The full VM address space (~258 MB) is committed in nanvixd, not bench-library. Measured by polling nanvixd's commit charge via `CreateToolhelp32Snapshot` + `K32GetProcessMemoryInfo` during execution.
 
-- **NanVix** — Each `execute()` spawns `nanvixd.exe` as a short-lived subprocess (~100ms). VM memory lives in nanvixd, not bench-library. Measured by polling `nanvixd.exe` commit charge via `CreateToolhelp32Snapshot` + `K32GetProcessMemoryInfo` during execution at 1ms intervals.
+- **WSLc** — Each `execute()` creates a container inside the shared WSL2 VM. Container memory is invisible to host process APIs — it lives in the `vmmem` kernel pseudo-process. Measured from inside the container via Linux cgroup stats (`/sys/fs/cgroup/memory.current`).
 
-- **WSLc** — Each `execute()` creates a container via `wslservice.exe` (persistent system service). Measured via Linux cgroup memory stats (`/sys/fs/cgroup/memory.current`) from inside the container during execution, capturing actual in-VM memory usage per container.
+We use commit charge (not working set) everywhere because it represents virtual memory backed by physical RAM or pagefile — stable under memory pressure, unlike working set which the OS can trim.
 
 ### Disk footprint per backend
 
