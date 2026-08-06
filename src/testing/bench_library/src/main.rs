@@ -665,6 +665,9 @@ struct DensityEntry {
     peak_daemon_commit_mb: Option<f64>,
     /// System-wide commit used after this runner's execute (GlobalMemoryStatusEx).
     system_commit_mb: f64,
+    /// Container memory from cgroup (WSLc only) — actual in-VM memory used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    container_memory_mb: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -694,10 +697,13 @@ struct DensityResult {
     final_daemon_commit_mb: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     per_runner_daemon_mb: Option<f64>,
+    /// Median per-container memory measured via cgroup (WSLc only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    per_container_memory_mb: Option<f64>,
     /// The cost used for density estimation:
     /// - Persistent backends (Hyperlight): persistent per-runner + daemon
     /// - Ephemeral backends (NanVix): peak per-execution + daemon
-    /// - WSLc: system-wide commit delta (captures VM memory)
+    /// - WSLc: cgroup memory from inside container (actual in-VM usage)
     density_cost_mb: f64,
     fits_in_1500mb: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -789,6 +795,21 @@ fn density_test(
         eprintln!("  Baseline process commit: {baseline_commit:.1} MB");
         eprintln!("  Baseline system commit:  {baseline_system_commit:.0} MB");
 
+        // For WSLc: create a density-specific request that appends cgroup
+        // memory measurement to the command so we capture actual in-VM
+        // container memory in the same execution.
+        let is_wslc = matches!(backend, ContainmentBackend::Wslc);
+        let density_request = if is_wslc {
+            let mut req = make_request(backend, wslc_image, None, workload);
+            req.script_code = format!(
+                "{} ; echo __CGROUP_MEM__=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null || echo 0)",
+                req.script_code
+            );
+            req
+        } else {
+            request
+        };
+
         let mut runners = Vec::with_capacity(n);
         let mut entries = Vec::with_capacity(n);
 
@@ -796,7 +817,7 @@ fn density_test(
             // Create runner
             let t_create = Instant::now();
             let mut logger = Logger::new(Mode::Buffer);
-            let resolved = match mxc_engine::resolve_runner(&request, &mut logger) {
+            let resolved = match mxc_engine::resolve_runner(&density_request, &mut logger) {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("  [{name}] runner {}/{n} FAILED: {e}", i + 1);
@@ -810,18 +831,31 @@ fn density_test(
             let daemon_names_owned: Vec<String> = dnames.iter().map(|s| s.to_string()).collect();
             let (resp, exec_ms, peak_commit, peak_dc) = execute_with_peak_commit(
                 runners.last_mut().unwrap().runner.as_mut(),
-                &request,
+                &density_request,
                 daemon_names_owned,
             );
 
             let commit = process_commit_mb();
             let sys_commit = system_commit_used_mb();
 
+            // Parse cgroup memory from stdout for WSLc
+            let container_mem = if is_wslc {
+                resp.standard_out.lines()
+                    .find_map(|line| {
+                        line.strip_prefix("__CGROUP_MEM__=")
+                            .and_then(|v| v.trim().parse::<f64>().ok())
+                            .map(|bytes| bytes / (1024.0 * 1024.0))
+                    })
+            } else {
+                None
+            };
+
             eprintln!(
-                "  [{name}] runner {}/{n}: create={create_ms:.1}ms  exec={exec_ms:.1}ms  exit={}  commit={commit:.1}MB  peakCommit={peak_commit:.1}MB  sysCommit={sys_commit:.0}MB{}",
+                "  [{name}] runner {}/{n}: create={create_ms:.1}ms  exec={exec_ms:.1}ms  exit={}  commit={commit:.1}MB  peakCommit={peak_commit:.1}MB{}{}",
                 i + 1,
                 resp.exit_code,
                 if has_daemon { format!("  peakDaemon={peak_dc:.1}MB") } else { String::new() },
+                if let Some(cm) = container_mem { format!("  containerMem={cm:.1}MB") } else { String::new() },
             );
 
             entries.push(DensityEntry {
@@ -833,6 +867,7 @@ fn density_test(
                 peak_commit_during_exec_mb: peak_commit,
                 peak_daemon_commit_mb: if has_daemon { Some(peak_dc) } else { None },
                 system_commit_mb: sys_commit,
+                container_memory_mb: container_mem,
             });
         }
 
@@ -899,14 +934,23 @@ fn density_test(
             None
         };
 
+        // Median container memory from cgroup (WSLc only)
+        let per_container_memory = if is_wslc {
+            let mut mems: Vec<f64> = entries.iter()
+                .filter_map(|e| e.container_memory_mb)
+                .collect();
+            mems.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            if !mems.is_empty() { Some(mems[mems.len() / 2]) } else { None }
+        } else {
+            None
+        };
+
         // Choose the right cost metric for density estimation:
         // - Hyperlight (persistent): per-runner commit + daemon
         // - NanVix (ephemeral): per-execution peak + daemon (nanvixd subprocess commit)
-        // - WSLc (ephemeral, VM-hosted): system-wide commit delta
-        //   (captures container memory in WSL2 VM invisible to per-process APIs)
-        let density_cost = if matches!(backend, ContainmentBackend::Wslc) {
-            // System-wide delta is the only way to capture WSL2 VM memory
-            per_runner_system.max(0.0)
+        // - WSLc: cgroup memory from inside container (actual in-VM usage per container)
+        let density_cost = if is_wslc {
+            per_container_memory.unwrap_or(per_runner_system.max(0.0))
         } else if ephemeral {
             per_exec_peak + per_runner_daemon.unwrap_or(0.0)
         } else {
@@ -929,6 +973,9 @@ fn density_test(
         eprintln!(
             "  [{name}] System commit delta:   {per_runner_system:.1} MB/runner"
         );
+        if let Some(cm) = per_container_memory {
+            eprintln!("  [{name}] Container memory (cgroup): {cm:.1} MB/container");
+        }
         if let (Some(d), Some(b)) = (per_runner_daemon, baseline_daemon_commit) {
             let label = if b < 0.1 { "subprocess" } else { "service delta" };
             eprintln!(
@@ -939,11 +986,7 @@ fn density_test(
             "  [{name}] => Density cost: {density_cost:.1} MB/runner  (~{fits} fit in 1.5 GB)"
         );
 
-        let note = if matches!(backend, ContainmentBackend::Wslc) {
-            Some("Measured via system-wide commit delta (container memory in WSL2 VM)".into())
-        } else {
-            None
-        };
+        let note: Option<String> = None;
 
         results.push(DensityResult {
             backend: name.to_string(),
@@ -965,6 +1008,7 @@ fn density_test(
             baseline_daemon_commit_mb: baseline_daemon_commit,
             final_daemon_commit_mb: final_daemon_commit,
             per_runner_daemon_mb: per_runner_daemon,
+            per_container_memory_mb: per_container_memory,
             density_cost_mb: density_cost,
             fits_in_1500mb: fits,
             note,
@@ -1447,12 +1491,37 @@ fn measure_disk(backend: &ContainmentBackend, wslc_image: &str) -> DiskResult {
             DiskResult { backend: name.to_string(), total_mb: total, files, note: None }
         }
         ContainmentBackend::Wslc => {
-            // Measure the OCI image rootfs from inside a WSLc container using du.
-            // The image is stored inside WSL2's shared ext4.vhdx and can't be
-            // attributed per-image from the host side, but we can measure its
-            // unpacked rootfs size from within.
-            eprintln!("  [WSLc] disk: measuring image rootfs from inside container...");
+            // WSLc needs:
+            //   1. The WSL2 runtime: system.vhd (kernel+OS image, equivalent to
+            //      Hyperlight's VM snapshot), wslservice.exe, container.exe, etc.
+            //   2. The OCI container image (rootfs measured from inside via du).
+            eprintln!("  [WSLc] disk: measuring WSL2 runtime + OCI image...");
 
+            let wsl_dir = std::path::PathBuf::from(r"C:\Program Files\WSL");
+            // Core WSLc runtime files (excludes GPU passthrough, RDP, and WSLg
+            // which are optional features not needed for container execution).
+            let runtime_files = vec![
+                wsl_dir.join("system.vhd"),        // WSL2 kernel+OS image
+                wsl_dir.join("wslservice.exe"),     // Container service
+                wsl_dir.join("container.exe"),      // Container runtime
+                wsl_dir.join("wslc.exe"),           // WSLc CLI
+                wsl_dir.join("wslcsession.exe"),    // Session manager
+                wsl_dir.join("wsl.exe"),            // WSL CLI
+                wsl_dir.join("wslhost.exe"),        // Host process
+                wsl_dir.join("libwsl.dll"),         // WSL library
+                wsl_dir.join("wslrelay.exe"),       // Relay
+                wsl_dir.join("wsldeps.dll"),        // Dependencies
+                wsl_dir.join("wsldevicehost.dll"),  // Device host
+            ];
+            let mut files: Vec<DiskFile> = runtime_files
+                .iter()
+                .filter_map(|p| measure_file(p))
+                .collect();
+            for f in &files {
+                eprintln!("    {} — {:.1} MB", f.name, f.actual_mb);
+            }
+
+            // OCI image rootfs (measured from inside a temporary container)
             let mut req = ExecutionRequest {
                 schema_version: "0.8.0".to_string(),
                 container_id: "bench-disk-wslc".to_string(),
@@ -1468,46 +1537,25 @@ fn measure_disk(backend: &ContainmentBackend, wslc_image: &str) -> DiskResult {
             });
 
             let mut logger = Logger::new(Mode::Buffer);
-            match mxc_engine::resolve_runner(&req, &mut logger) {
-                Ok(resolved) => {
-                    let mut runner = resolved.runner;
-                    let resp = runner.execute(&req, &mut Logger::new(Mode::Buffer));
-
-                    // Parse du output: "51200\t/" means 51200 KB = 50 MB
-                    let total_mb = resp.standard_out.lines().next().and_then(|line| {
-                        let kb_str = line.split_whitespace().next()?;
-                        let kb: f64 = kb_str.parse().ok()?;
-                        Some(kb / 1024.0)
-                    }).unwrap_or(0.0);
-
-                    if total_mb > 0.0 {
-                        eprintln!("  [WSLc] disk: {total_mb:.1} MB (image rootfs via du)");
-                        DiskResult {
-                            backend: name.to_string(),
-                            total_mb,
-                            files: vec![DiskFile {
-                                name: format!("{wslc_image} (rootfs)"),
-                                logical_mb: total_mb,
-                                actual_mb: total_mb,
-                            }],
-                            note: Some("measured from inside container via du -sx /".into()),
-                        }
-                    } else {
-                        eprintln!("  [WSLc] disk: du failed, stdout={:?}", resp.standard_out);
-                        DiskResult {
-                            backend: name.to_string(), total_mb: 0.0, files: vec![],
-                            note: Some("could not measure image rootfs from inside container".into()),
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("  [WSLc] disk: failed to create runner: {e}");
-                    DiskResult {
-                        backend: name.to_string(), total_mb: 0.0, files: vec![],
-                        note: Some(format!("failed to create runner for disk measurement: {e}")),
-                    }
+            if let Ok(resolved) = mxc_engine::resolve_runner(&req, &mut logger) {
+                let mut runner = resolved.runner;
+                let resp = runner.execute(&req, &mut Logger::new(Mode::Buffer));
+                if let Some(image_mb) = resp.standard_out.lines().next().and_then(|line| {
+                    let kb: f64 = line.split_whitespace().next()?.parse().ok()?;
+                    Some(kb / 1024.0)
+                }) {
+                    eprintln!("    {} (rootfs) — {:.1} MB", wslc_image, image_mb);
+                    files.push(DiskFile {
+                        name: format!("{wslc_image} (rootfs)"),
+                        logical_mb: image_mb,
+                        actual_mb: image_mb,
+                    });
                 }
             }
+
+            let total: f64 = files.iter().map(|f| f.actual_mb).sum();
+            eprintln!("  [WSLc] disk: {total:.1} MB total");
+            DiskResult { backend: name.to_string(), total_mb: total, files, note: None }
         }
         _ => DiskResult { backend: name.to_string(), total_mb: 0.0, files: vec![], note: None },
     }

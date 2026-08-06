@@ -32,13 +32,13 @@ We measure **memory commit** (`PagefileUsage` from `PROCESS_MEMORY_COUNTERS`) ra
 
 - **NanVix** — Each `execute()` spawns `nanvixd.exe` as a short-lived subprocess (~100ms). VM memory lives in nanvixd, not bench-library. Measured by polling `nanvixd.exe` commit charge via `CreateToolhelp32Snapshot` + `K32GetProcessMemoryInfo` during execution at 1ms intervals.
 
-- **WSLc** — Each `execute()` creates a container via `wslservice.exe` (persistent system service). Measured as wslservice commit delta + bench-library client overhead. **Note:** container memory lives in the WSL2 VM and is not visible in host process commit — reported numbers capture Windows-side overhead only.
+- **WSLc** — Each `execute()` creates a container via `wslservice.exe` (persistent system service). Measured via Linux cgroup memory stats (`/sys/fs/cgroup/memory.current`) from inside the container during execution, capturing actual in-VM memory usage per container.
 
 ### Disk footprint per backend
 
 - **Hyperlight** — OCI snapshot at `%LOCALAPPDATA%\pyhl\snapshot\` (sparse-aware). Installed by `wxc-exec --setup-hyperlight`.
 - **NanVix** — `nanvixd.exe`, `nanvix_rootfs.img`, `python3.initrd`, `kernel.elf` next to `wxc-exec.exe`.
-- **WSLc** — OCI images stored inside shared WSL2 ext4.vhdx. Measured by creating a temporary container and running `du -sx /` to capture the unpacked image rootfs size.
+- **WSLc** — Core WSL2 runtime (`C:\Program Files\WSL\`: `system.vhd`, `wslservice.exe`, `container.exe`, etc.) plus OCI image rootfs measured from inside a temporary container via `du -sx /`.
 
 ## Individual benchmarks
 
