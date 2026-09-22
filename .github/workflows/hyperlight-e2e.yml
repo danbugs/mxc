@@ -71,18 +71,18 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile crane.tar.gz -UseBasicParsing
           tar -xzf crane.tar.gz crane.exe
 
-      - name: Download Hyperlight kernel and initrd
+      - name: Download Hyperlight rootfs
         if: steps.whp-check.outputs.whp_available == 'true'
         shell: pwsh
         run: |
           $pyhlHome = Join-Path $env:LOCALAPPDATA "pyhl"
           New-Item -ItemType Directory -Force -Path $pyhlHome | Out-Null
 
-          $tag = "v0.12.1"
-          .\crane.exe export ghcr.io/hyperlight-dev/hyperlight-unikraft/python-agent-driver-kernel:$tag kernel.tar
-          tar -xf kernel.tar -C $pyhlHome kernel
-
-          .\crane.exe export ghcr.io/hyperlight-dev/hyperlight-unikraft/python-agent-driver-initrd:$tag initrd.tar
+          # The Unikraft kernel is embedded in the hyperlight-unikraft crate; only
+          # the agent rootfs (initrd.cpio) is fetched, pinned to the crate release
+          # declared in src/backends/hyperlight/common/Cargo.toml.
+          $tag = "initrd-v0.14.1"
+          .\crane.exe export ghcr.io/hyperlight-dev/hyperlight-unikraft/agent:$tag initrd.tar
           tar -xf initrd.tar -C $pyhlHome initrd.cpio
 
           Write-Host "Downloaded to ${pyhlHome}:"

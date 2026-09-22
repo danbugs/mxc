@@ -229,7 +229,7 @@ fn windows_backends(
         ));
     }
 
-    // WHP is delay-loaded; check before pyhl::install warms a VM.
+    // WHP is delay-loaded; check before setup boots a VM.
     #[cfg(all(feature = "hyperlight", target_arch = "x86_64"))]
     if hyperlight_common::is_whp_available() {
         backends.push(AvailableBackend::tierless(

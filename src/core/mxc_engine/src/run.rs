@@ -492,7 +492,8 @@ fn resolve_runner_inner(
 /// Construct the Hyperlight runner, shared by the Windows and Linux bodies.
 /// Requires x86_64 (Hyperlight needs KVM or WHP) and the `hyperlight` feature.
 /// On Windows, pre-checks that `winhvplatform.dll` is loadable so a missing
-/// WHP becomes a typed error rather than a delay-load SEH exception.
+/// WHP becomes a typed error rather than a delay-load SEH exception; on
+/// Linux, that `/dev/kvm` opens for reading and writing, for the same reason.
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn resolve_hyperlight(request: &ExecutionRequest) -> Result<ResolvedRunner, MxcError> {
     #[cfg(all(feature = "hyperlight", target_arch = "x86_64"))]
@@ -503,12 +504,19 @@ fn resolve_hyperlight(request: &ExecutionRequest) -> Result<ResolvedRunner, MxcE
                  Use --experimental flag.",
             ));
         }
-        // WHP is delay-loaded; check before pyhl::install warms a VM.
+        // WHP is delay-loaded; check before setup boots a VM.
         #[cfg(target_os = "windows")]
         if !hyperlight_common::is_whp_available() {
             return Err(MxcError::backend_unavailable(
                 "Hyperlight requires Windows Hypervisor Platform (WHP). \
                  Enable the HypervisorPlatform Windows optional feature and reboot.",
+            ));
+        }
+        // KVM is checked before a run boots a VM, as WHP is on Windows.
+        #[cfg(target_os = "linux")]
+        if !hyperlight_common::is_kvm_available() {
+            return Err(MxcError::backend_unavailable(
+                "Hyperlight requires KVM: /dev/kvm must be readable and writable by this user.",
             ));
         }
         Ok(ResolvedRunner::without_guard(Box::new(

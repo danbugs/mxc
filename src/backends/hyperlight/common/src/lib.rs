@@ -12,54 +12,66 @@
 #![cfg(all(feature = "hyperlight", target_arch = "x86_64"))]
 
 //! `HyperlightScriptRunner` — executes Python code inside a Hyperlight + Unikraft
-//! micro-VM, driven by the `hyperlight-unikraft::pyhl` library.
+//! micro-VM, driven by the `hyperlight-unikraft` library.
 //!
 //! | Property            | Value                                                     |
 //! |---------------------|-----------------------------------------------------------|
 //! | Backing micro-VM    | Unikraft unikernel in a Hyperlight micro-VM               |
 //! | Host platform       | Linux (KVM) + Windows (WHP)                               |
 //! | Execution model     | Embedded library, in-process                              |
-//! | Script delivery     | Direct `Runtime::run_code(&str)`                          |
-//! | Cold start          | Snapshot restore (~50–60 ms)                              |
-//! | Filesystem          | Host dir mounts via `Preopen`                             |
+//! | Script delivery     | `AppSandbox::run`, or `submit` + `step` under a deadline  |
+//! | Cold start          | Snapshot restore (~50–60 ms)                               |
+//! | Filesystem          | Host dir mounts via `Mount`                               |
 //! | Networking          | Host-proxied sockets via `NetworkPolicy`                  |
-//! | Script I/O          | Host's stdout/stderr (host_print)                         |
+//! | Script I/O          | Host's stdout/stderr (HostPrint)                          |
 //! | stdlib coverage     | Full CPython + preloaded ML stack (numpy, pandas, etc.)   |
 //!
 //! ## Image-home resolution
 //!
 //! The runner looks for a warmed image in this order, first hit wins:
 //!
-//!   1. `$PYHL_HOME` (override — if set, must be a usable install)
+//!   1. `$PYHL_HOME` (searched first when set)
 //!   2. `~/.local/share/pyhl/` on Linux (XDG_DATA_HOME compliant)
 //!      `%LOCALAPPDATA%\pyhl\` on Windows
 //!   3. `<exe_dir>/pyhl/` (dev build next to the target binary)
-//!   4. `<cwd>/.pyhl/` (dev fallback, same as pyhl's own CLI)
+//!   4. `<cwd>/.pyhl/` (dev fallback)
 //!
 //! Path #2 is the "default". `--setup-hyperlight` installs here when nothing
 //! else is already populated — so one eager install persists across
 //! shell sessions, across reboots, and across `cargo install` upgrades.
 //!
+//! An image home holds the guest rootfs (`initrd.cpio`), the warmed
+//! `snapshot/` directory, and a `VERSION` stamp naming the rootfs release.
+//! The Unikraft kernel is embedded in the `hyperlight-unikraft` crate, so
+//! nothing else is downloaded. A snapshot loads only under a build with
+//! its snapshot key (the crate's kernel and host contract), and a rootfs
+//! only boots on its own release's kernel, so a home whose stamp or
+//! snapshot key is another build's is treated as not installed:
+//! `--setup-hyperlight` rebuilds it, and a run warms a new snapshot by
+//! itself when only the snapshot is stale.
+//!
 //! ## Setup
 //!
-//! `lxc-exec --setup-hyperlight` (or `wxc-exec --setup-hyperlight`) installs the
-//! warm snapshot. It pulls the published kernel + initrd from GHCR
-//! via docker or podman, warms them
-//! up, and persists a snapshot to the default home — zero
-//! configuration beyond having docker/podman on `$PATH`.
+//! `lxc-exec --setup-hyperlight` (or `wxc-exec --setup-hyperlight`) pulls
+//! the published `agent` rootfs from GHCR via docker or podman, boots it
+//! once, and persists the warmed guest as a snapshot in the default home —
+//! zero configuration beyond having docker/podman on `$PATH`.
 //!
 //! On first `run` (if setup was skipped) the runner also does a lazy
-//! auto-install if kernel+initrd are already in the resolved home
-//! but no snapshot is — cheap safety net.
+//! auto-install if `initrd.cpio` is already in the resolved home but no
+//! snapshot is — cheap safety net.
 //!
 //! ## Filesystem policy
 //!
 //! `policy.readwritePaths` and `policy.readonlyPaths` are translated to
-//! [`Preopen`] entries — the guest sees the host directories at
-//! `/host/<basename>` and can read/write through them via `lib/hostfs`.
-//! `readonlyPaths` are mounted with `Preopen::read_only()`, which blocks
-//! all write operations (`fs_write`, `fs_mkdir`, `fs_unlink`, etc.) at
-//! the host-function level.
+//! [`Mount`] entries — the guest sees the host directories at
+//! `/host/<basename>`. `readonlyPaths` are mounted read-only, which the
+//! guest kernel enforces (`EROFS`) and the host's `fs_*` functions enforce
+//! again.
+//!
+//! The persisted snapshot is warmed without mounts; the kernel builds its
+//! mount table from the mounts a restore names, so every request restores
+//! the same warm image, mounts or not.
 //!
 //! `policy.deniedPaths` is honored: any path that appears in the denied
 //! list is rejected at preflight — including paths that also appear in
@@ -67,31 +79,47 @@
 //!
 //! ## I/O model
 //!
-//! The guest's `print(...)` goes through Hyperlight's host_print callback,
+//! The guest's `print(...)` goes through Hyperlight's HostPrint callback,
 //! which writes to the **host process's stdout**. `ScriptResponse.standard_out`
 //! and `standard_err` stay empty; consumers that need captured output
 //! redirect wxc-exec's stdout/stderr at the process level.
 //!
 //! ## Exit codes
 //!
-//! Guest exit code on clean `run_code` completion (0 for normal exit,
-//! non-zero for `sys.exit(N)` or unhandled exceptions), -1 on any
-//! runner error (preflight, install, runtime, guest crash). The specific
+//! Guest exit code on clean completion (0 for normal exit, non-zero for
+//! `sys.exit(N)` or unhandled exceptions), -1 on any runner error
+//! (preflight, install, runtime, guest crash, timeout). The specific
 //! failure mode is in `error_message`.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use wxc_common::logger::Logger;
 use wxc_common::models::{ExecutionRequest, NetworkPolicy, ScriptResponse};
 use wxc_common::script_runner::ScriptRunner;
 use wxc_common::validator::{validate_network_policy_support, NetworkPolicySupport};
 
-use hyperlight_unikraft::pyhl;
-use hyperlight_unikraft::{AllowList, BlockList, Preopen};
+use hyperlight_unikraft::hyperlight_host::HyperlightError;
+use hyperlight_unikraft::{
+    AllowList, AppSandbox, BlockList, Mount, SandboxBuilder, Snapshot, Yield,
+};
 
 // -- Availability probe -------------------------------------------------------
 
-/// WHP is delay-loaded; check before pyhl::install warms a VM.
+/// Whether KVM is usable by this process: `/dev/kvm` opens for reading and
+/// writing. Setup and a run check it before booting anything.
+#[cfg(target_os = "linux")]
+pub fn is_kvm_available() -> bool {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+        .is_ok()
+}
+
+/// WHP is delay-loaded; check before setup or a run boots a VM.
 #[cfg(target_os = "windows")]
 pub fn is_whp_available() -> bool {
     use windows::core::w;
@@ -106,23 +134,23 @@ pub fn is_whp_available() -> bool {
 // -- Error classification ----------------------------------------------------
 
 #[derive(Debug)]
-enum PyhlError {
+enum RunnerError {
     /// Pre-spawn validation failures (missing image, unsupported policy).
     Preflight(String),
     /// Runtime construction, install, or execution failure.
     Runtime(String),
 }
 
-impl std::fmt::Display for PyhlError {
+impl std::fmt::Display for RunnerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PyhlError::Preflight(msg) => write!(f, "hyperlight preflight error: {msg}"),
-            PyhlError::Runtime(msg) => write!(f, "hyperlight runtime error: {msg}"),
+            RunnerError::Preflight(msg) => write!(f, "hyperlight preflight error: {msg}"),
+            RunnerError::Runtime(msg) => write!(f, "hyperlight runtime error: {msg}"),
         }
     }
 }
 
-impl PyhlError {
+impl RunnerError {
     fn to_response(&self) -> ScriptResponse {
         ScriptResponse {
             exit_code: ERROR_EXIT_CODE,
@@ -146,35 +174,103 @@ const CWD_RELATIVE_HOME: &str = ".pyhl";
 /// Final component of the default OS-local data path.
 const DEFAULT_HOME_LEAF: &str = "pyhl";
 
-// The filenames the installer writes; duplicated here to avoid a
-// compile-time dep on internal path constants.
-const KERNEL_FILE: &str = "kernel";
+/// The guest rootfs (a CPIO archive) inside an image home. The kernel is
+/// embedded in the `hyperlight-unikraft` crate, so this is the only
+/// artifact an install needs.
 const INITRD_FILE: &str = "initrd.cpio";
+/// The warmed snapshot (an OCI image layout) inside an image home.
 const SNAPSHOT_DIR: &str = "snapshot";
+/// Stamp `setup` writes beside the rootfs, naming the release it holds.
+const VERSION_FILE: &str = "VERSION";
+
+/// The published rootfs: the `agent` runtime (CPython plus numpy, pandas,
+/// scipy, scikit-learn, ...). Its `:initrd-<version>` tag wraps the runnable
+/// CPIO in a scratch image at [`ROOTFS_PATH_IN_IMAGE`].
+const ROOTFS_IMAGE: &str = "ghcr.io/hyperlight-dev/hyperlight-unikraft/agent";
+/// Pinned to the `hyperlight-unikraft` release in Cargo.toml: a rootfs
+/// only boots on the kernel and driver protocol of its own release.
+const ROOTFS_TAG: &str = "initrd-v0.14.1";
+const ROOTFS_PATH_IN_IMAGE: &str = "/initrd.cpio";
+/// Scratch memory for the agent image — upstream's own figure for it; the
+/// ML stack needs far more than the library's 256 MiB default.
+const SCRATCH_MB: usize = 1536;
+/// Where host directories appear in the guest: `/host/<basename>`.
+const GUEST_MOUNT_ROOT: &str = "/host";
 
 const ERR_PROXY_POLICY: &str = "network proxy is not supported by the hyperlight backend";
 const ERR_WORKDIR: &str =
     "workingDirectory is not supported by the hyperlight backend -- guest has its own filesystem namespace";
 const ERR_NO_INSTALL_SOURCE: &str =
-    "no warmed snapshot and no kernel/initrd to install from. drop `kernel` and `initrd.cpio` \
-     into the image home (or run `--setup-hyperlight`).";
+    "no warmed snapshot and no rootfs to install from. drop `initrd.cpio` into the image \
+     home (or run `--setup-hyperlight`).";
 
 // -- Runner ------------------------------------------------------------------
 
 /// Script runner that executes Python code inside a Hyperlight+Unikraft
 /// micro-VM.
 ///
-/// Lazily instantiates the runtime on the first call (loading the
-/// persisted snapshot, auto-installing it first if needed) and reuses
-/// it across subsequent calls on the same runner instance. Every
-/// `run_code` rewinds the guest to the post-warmup snapshot so
-/// consecutive calls are hermetic.
+/// Lazily brings up the guest on the first call (loading the persisted
+/// snapshot, auto-installing it first if needed) and reuses it across
+/// subsequent calls on the same runner instance. Every call rewinds the
+/// guest to the post-warmup snapshot first, so consecutive calls are
+/// hermetic.
 pub struct HyperlightScriptRunner {
-    runtime: Option<pyhl::Runtime>,
+    guest: Option<Guest>,
+    /// The persisted warm image, loaded once per home. Outlives `guest`:
+    /// a call that fails or times out drops the guest, and the next call
+    /// boots a fresh one from here instead of reloading it from disk.
+    rewind: Option<Arc<Snapshot>>,
     active_home: Option<PathBuf>,
-    active_preopens: Vec<Preopen>,
-    active_network_hosts: Vec<String>,
-    active_network_default: NetworkPolicy,
+    active_mounts: Vec<Mount>,
+    active_policy: Option<hyperlight_unikraft::NetworkPolicy>,
+    active_network: NetworkKey,
+}
+
+/// The request's network policy as the runner keys a booted guest on it.
+/// Both host lists are kept, so an allow list and a block list of the
+/// same hosts key differently.
+#[derive(Clone, Debug, PartialEq, Default)]
+struct NetworkKey {
+    allowed: Vec<String>,
+    blocked: Vec<String>,
+    default: NetworkPolicy,
+}
+
+impl NetworkKey {
+    fn from_request(request: &ExecutionRequest) -> Self {
+        let sorted = |hosts: &[String]| {
+            let mut hosts = hosts.to_vec();
+            hosts.sort();
+            hosts.dedup();
+            hosts
+        };
+        Self {
+            allowed: sorted(&request.policy.allowed_hosts),
+            blocked: sorted(&request.policy.blocked_hosts),
+            default: request.policy.default_network_policy.clone(),
+        }
+    }
+}
+
+/// A booted guest, parked at a boundary between calls.
+struct Guest {
+    sandbox: AppSandbox,
+    /// True until the first call: the guest is already at the rewind point.
+    fresh: bool,
+}
+
+/// Wall-clock split of one call.
+#[derive(Debug, Default)]
+struct RunTiming {
+    restore_ms: f64,
+    call_ms: f64,
+    exit_code: i32,
+}
+
+/// Why a call produced no exit code.
+enum RunError {
+    TimedOut(Duration),
+    Failed(String),
 }
 
 impl Default for HyperlightScriptRunner {
@@ -187,10 +283,9 @@ impl Default for HyperlightScriptRunner {
 /// pays no warmup cost. Intended to be called from a tool install
 /// step (npm postinstall, a `--setup-hyperlight` CLI flag, CI, etc.).
 ///
-/// Pulls the published `kernel` + `initrd.cpio` from GHCR
-/// via docker or podman, runs warmup, and
-/// persists the snapshot to disk. Zero configuration beyond having
-/// docker/podman on `$PATH`.
+/// Pulls the published rootfs from GHCR via docker or podman, boots it
+/// once, and persists the warmed guest as a snapshot. Zero configuration
+/// beyond having docker/podman on `$PATH`.
 ///
 /// # Destination
 ///
@@ -203,8 +298,9 @@ impl Default for HyperlightScriptRunner {
 ///
 /// # Force
 ///
-/// When `force` is false, an existing snapshot is a no-op. When
-/// `force` is true, the snapshot is rebuilt.
+/// When `force` is false, an existing install for this release is a
+/// no-op; one left by another release is rebuilt. When `force` is true,
+/// the snapshot is rebuilt regardless.
 pub fn setup(force: bool, logger: &mut Logger) -> Result<PathBuf, String> {
     let home = match std::env::var_os(PYHL_HOME_ENV) {
         Some(v) => PathBuf::from(v),
@@ -222,53 +318,72 @@ pub fn setup(force: bool, logger: &mut Logger) -> Result<PathBuf, String> {
 
     std::fs::create_dir_all(&home).map_err(|e| format!("create image home {home:?}: {e}"))?;
 
-    logger.log_line("hyperlight setup: pulling image from GHCR (docker/podman)");
-    let opts = pyhl::InstallOptions {
-        home: &home,
-        source: pyhl::InstallSource::Ghcr {
-            tag: Some("v0.12.1"),
-        },
-        mounts: &[],
-        network: None,
-        listen_ports: None,
-        max_surrogates: None,
-        force,
-    };
-    let report = pyhl::install(&opts).map_err(|e| format!("hyperlight install: {e:#}"))?;
-    logger.log_line(&format!(
-        "hyperlight: install complete (warmup={:.1}ms, snapshot at {:?})",
-        report.warmup_ms, report.snapshot
-    ));
-    Ok(report.snapshot)
+    // A rootfs of this release already in the home is kept, so a rebuild
+    // (a stale snapshot, or --force after replacing it) only warms.
+    if has_install_source(&home) {
+        logger.log_line(&format!(
+            "hyperlight setup: rootfs present at {:?}",
+            home.join(INITRD_FILE)
+        ));
+    } else {
+        logger.log_line(&format!(
+            "hyperlight setup: pulling {ROOTFS_IMAGE}:{ROOTFS_TAG} (docker/podman)"
+        ));
+        pull_rootfs(&home.join(INITRD_FILE), logger)?;
+        std::fs::write(home.join(VERSION_FILE), version_stamp())
+            .map_err(|e| format!("write {VERSION_FILE}: {e}"))?;
+    }
+
+    let (_, persisted) = warm_snapshot(&home, logger).map_err(|e| e.to_string())?;
+    if !persisted {
+        return Err(format!(
+            "the snapshot could not be put in place at {:?}; the log above says why",
+            home.join(SNAPSHOT_DIR)
+        ));
+    }
+    Ok(home.join(SNAPSHOT_DIR))
 }
 
 impl HyperlightScriptRunner {
     pub fn new() -> Self {
         Self {
-            runtime: None,
+            guest: None,
+            rewind: None,
             active_home: None,
-            active_preopens: Vec::new(),
-            active_network_hosts: Vec::new(),
-            active_network_default: NetworkPolicy::default(),
+            active_mounts: Vec::new(),
+            active_policy: None,
+            active_network: NetworkKey::default(),
         }
     }
 
     /// Resolve the image home for a normal run. Walks the
     /// discovery chain (see module doc) and returns the first
-    /// location that has at least kernel + initrd — snapshot may be
+    /// location that has at least the rootfs — snapshot may be
     /// missing, the runner will install it.
-    fn resolve_home() -> Result<PathBuf, PyhlError> {
+    fn resolve_home() -> Result<PathBuf, RunnerError> {
+        let mut stale = None;
         for cand in Self::search_paths() {
-            if has_install_source(&cand) || is_installed(&cand) {
+            if is_installed(&cand) || has_install_source(&cand) {
                 return Ok(cand);
+            }
+            if stale.is_none() && cand.join(INITRD_FILE).is_file() {
+                stale = Some(cand);
             }
         }
         let default = Self::default_home();
-        Err(PyhlError::Preflight(format!(
+        let hint = match stale {
+            Some(home) => format!(
+                "{home:?} holds a rootfs from another hyperlight-unikraft release; \
+                 run `lxc-exec --setup-hyperlight` to rebuild it."
+            ),
+            None => format!(
+                "run `lxc-exec --setup-hyperlight` \
+                 (or drop `{INITRD_FILE}` into {default:?})."
+            ),
+        };
+        Err(RunnerError::Preflight(format!(
             "no hyperlight image found. searched ${PYHL_HOME_ENV}, {default:?}, \
-             <exe>/{EXE_RELATIVE_HOME}/, <cwd>/{CWD_RELATIVE_HOME}/. \
-             run `lxc-exec --setup-hyperlight` \
-             (or drop `{KERNEL_FILE}` and `{INITRD_FILE}` into {default:?})."
+             <exe>/{EXE_RELATIVE_HOME}/, <cwd>/{CWD_RELATIVE_HOME}/. {hint}"
         )))
     }
 
@@ -302,22 +417,20 @@ impl HyperlightScriptRunner {
 
     /// Reject only policies that the hyperlight backend genuinely cannot honor.
     /// Filesystem mounts and network policies ARE supported.
-    fn validate_policies(request: &ExecutionRequest) -> Result<(), PyhlError> {
+    fn validate_policies(request: &ExecutionRequest) -> Result<(), RunnerError> {
         if request.policy.network_proxy.is_enabled() {
-            return Err(PyhlError::Preflight(ERR_PROXY_POLICY.to_string()));
+            return Err(RunnerError::Preflight(ERR_PROXY_POLICY.to_string()));
         }
         if !request.working_directory.is_empty() {
-            return Err(PyhlError::Preflight(ERR_WORKDIR.to_string()));
+            return Err(RunnerError::Preflight(ERR_WORKDIR.to_string()));
         }
         if !request.policy.allowed_hosts.is_empty() && !request.policy.blocked_hosts.is_empty() {
-            return Err(PyhlError::Preflight(
+            return Err(RunnerError::Preflight(
                 "allowedHosts and blockedHosts are mutually exclusive".to_string(),
             ));
         }
 
         // Denied paths: block early if any appears in the allow lists.
-        // Also reject a config that only specifies denies — there's no
-        // positive policy to apply and an attacker might be probing.
         for denied in &request.policy.denied_paths {
             if request
                 .policy
@@ -330,7 +443,7 @@ impl HyperlightScriptRunner {
                     .iter()
                     .any(|p| same_path(p, denied))
             {
-                return Err(PyhlError::Preflight(format!(
+                return Err(RunnerError::Preflight(format!(
                     "path {denied:?} appears in both deniedPaths and an allow list"
                 )));
             }
@@ -339,44 +452,40 @@ impl HyperlightScriptRunner {
         Ok(())
     }
 
-    /// Translate MXC's network policy fields into a pyhl `NetworkPolicy`.
+    /// Translate MXC's network policy fields into a guest `NetworkPolicy`.
     ///
     /// - `allowed_hosts` non-empty → `AllowList` (only listed hosts reachable)
     /// - `blocked_hosts` non-empty → `BlockList` (listed hosts denied, rest allowed)
     /// - `default_network_policy == Block`, no host lists → `None` (networking disabled)
     /// - `default_network_policy == Allow`, no host lists → `AllowAll`
-    fn network_policy_from_request(
-        request: &ExecutionRequest,
-    ) -> Result<Option<hyperlight_unikraft::NetworkPolicy>, PyhlError> {
-        if !request.policy.allowed_hosts.is_empty() {
-            let allow_list = AllowList::from_hosts(&request.policy.allowed_hosts)
-                .map_err(|e| PyhlError::Preflight(format!("resolve allowed_hosts: {e:#}")))?;
+    fn network_policy_from_key(
+        key: &NetworkKey,
+    ) -> Result<Option<hyperlight_unikraft::NetworkPolicy>, RunnerError> {
+        if !key.allowed.is_empty() {
+            let allow_list = AllowList::from_hosts(&key.allowed)
+                .map_err(|e| RunnerError::Preflight(format!("resolve allowed_hosts: {e}")))?;
             return Ok(Some(hyperlight_unikraft::NetworkPolicy::AllowList(
                 allow_list,
             )));
         }
-        if !request.policy.blocked_hosts.is_empty() {
-            let block_list = BlockList::from_hosts(&request.policy.blocked_hosts)
-                .map_err(|e| PyhlError::Preflight(format!("resolve blocked_hosts: {e:#}")))?;
+        if !key.blocked.is_empty() {
+            let block_list = BlockList::from_hosts(&key.blocked)
+                .map_err(|e| RunnerError::Preflight(format!("resolve blocked_hosts: {e}")))?;
             return Ok(Some(hyperlight_unikraft::NetworkPolicy::BlockList(
                 block_list,
             )));
         }
-        if request.policy.default_network_policy == NetworkPolicy::Block {
+        if key.default == NetworkPolicy::Block {
             return Ok(None);
         }
         Ok(Some(hyperlight_unikraft::NetworkPolicy::AllowAll))
     }
 
     /// Translate `ContainerPolicy.{readwrite,readonly}Paths` into
-    /// `Preopen` entries. Each host path is exposed inside the guest at
-    /// `/host/<basename>` — matches the `pyhl` CLI's `--mount <host>` default
-    /// shape so scripts can find mounts predictably.
-    ///
-    /// `readonlyPaths` are mounted with `Preopen::read_only()`, blocking
-    /// all write operations at the host-function level.
-    fn preopens_from_policy(request: &ExecutionRequest) -> Result<Vec<Preopen>, PyhlError> {
-        let mut preopens = Vec::new();
+    /// [`Mount`] entries. Each host path is exposed inside the guest at
+    /// `/host/<basename>` so scripts can find mounts predictably.
+    fn mounts_from_policy(request: &ExecutionRequest) -> Result<Vec<Mount>, RunnerError> {
+        let mut mounts = Vec::new();
         let mut seen_guest_paths = std::collections::HashSet::new();
 
         let rw_iter = request.policy.readwrite_paths.iter().map(|p| (p, false));
@@ -385,13 +494,13 @@ impl HyperlightScriptRunner {
         for (host, read_only) in rw_iter.chain(ro_iter) {
             let host_path = PathBuf::from(host);
 
-            // Auto-create the mount dir if it doesn't exist yet.
-            // `Preopen::new` canonicalizes the host path, which fails on
-            // ENOENT — so without this, a relative path like
-            // "../tmp/foo" fails silently just because the dir wasn't
-            // pre-created. The guest's hostfs still needs a real dir to
-            // read/write against; mkdir-ing now matches the "config is
-            // declaratively requesting this mount" semantics.
+            // Auto-create the mount dir if it doesn't exist yet. The
+            // host path is canonicalized below, which fails on ENOENT —
+            // so without this, a relative path like "../tmp/foo" fails
+            // silently just because the dir wasn't pre-created. The
+            // guest still needs a real dir to read/write against;
+            // mkdir-ing now matches the "config is declaratively
+            // requesting this mount" semantics.
             //
             // We only create if the parent already exists — prevents
             // accidentally materializing arbitrary paths on a typo.
@@ -401,118 +510,172 @@ impl HyperlightScriptRunner {
                     .map(|p| p.as_os_str().is_empty() || p.exists())
                     .unwrap_or(false);
                 if !parent_ok {
-                    return Err(PyhlError::Preflight(format!(
+                    return Err(RunnerError::Preflight(format!(
                         "mount path {host:?} does not exist and its parent doesn't either; \
                          refusing to auto-create (fix the path or `mkdir -p` manually)"
                     )));
                 }
                 std::fs::create_dir_all(&host_path).map_err(|e| {
-                    PyhlError::Preflight(format!("auto-create mount dir {host:?}: {e}"))
+                    RunnerError::Preflight(format!("auto-create mount dir {host:?}: {e}"))
                 })?;
             }
 
+            // Canonical so the mount set compares stably across calls and
+            // so a relative path keeps meaning the same directory after a
+            // cwd change.
+            let host_path = std::fs::canonicalize(&host_path)
+                .map_err(|e| RunnerError::Preflight(format!("resolve mount path {host:?}: {e}")))?;
             let basename = host_path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .ok_or_else(|| {
-                    PyhlError::Preflight(format!("mount path {host:?} has no filename component"))
+                    RunnerError::Preflight(format!("mount path {host:?} has no filename component"))
                 })?;
-            let guest_path = format!("/host/{basename}");
+            // The guest path travels to the kernel in its `vfs.fstab`
+            // list, which these characters would break; the library
+            // refuses them at boot, we refuse them before booting.
+            if basename
+                .chars()
+                .any(|c| c.is_whitespace() || matches!(c, ':' | '[' | ']'))
+            {
+                return Err(RunnerError::Preflight(format!(
+                    "mount path {host:?}: the directory name may not contain whitespace, \
+                     ':' or brackets (it names the guest mount point)"
+                )));
+            }
+            let guest_path = format!("{GUEST_MOUNT_ROOT}/{basename}");
             if !seen_guest_paths.insert(guest_path.clone()) {
-                return Err(PyhlError::Preflight(format!(
+                return Err(RunnerError::Preflight(format!(
                     "two mount paths collide on guest path {guest_path:?}; \
                      rename one of the host directories"
                 )));
             }
-            let mut pre = Preopen::new(&host_path, &guest_path).map_err(|e| {
-                PyhlError::Preflight(format!(
-                    "build Preopen for {host:?} -> {guest_path:?}: {e:#}"
-                ))
-            })?;
-            if read_only {
-                pre = pre.read_only();
-            }
-            preopens.push(pre);
+            mounts.push(if read_only {
+                Mount::ro(host_path, guest_path)
+            } else {
+                Mount::rw(host_path, guest_path)
+            });
         }
 
-        Ok(preopens)
+        Ok(mounts)
     }
 
-    /// Lazily bring up the embedded Hyperlight runtime.
+    /// Lazily bring up the guest for this configuration.
     ///
-    /// If the persisted snapshot is missing but kernel + initrd are
-    /// present, run install in-line (warmup boot + persist, cost
-    /// ~1.5–2 s, once per image). Subsequent runners on the same home
-    /// go straight to restore.
+    /// The guest restores the persisted snapshot (warming and persisting
+    /// one first if only the rootfs is present, a cold boot once per
+    /// image) with the request's mounts and network policy; the kernel
+    /// builds its mount table from them on resume. Later calls on the
+    /// same runner rewind rather than boot.
     ///
-    /// The mount set is baked into the runtime at construction time;
-    /// different preopens between calls force a full teardown + rebuild.
+    /// The mount set and network policy are fixed at boot; a change in
+    /// either boots another guest from the same image.
     fn ensure_runtime(
         &mut self,
         home: &Path,
-        preopens: Vec<Preopen>,
-        network: Option<hyperlight_unikraft::NetworkPolicy>,
-        network_hosts: &[String],
-        network_default: NetworkPolicy,
+        mounts: Vec<Mount>,
+        network: NetworkKey,
         logger: &mut Logger,
-    ) -> Result<&mut pyhl::Runtime, PyhlError> {
-        let same_home = self.active_home.as_deref() == Some(home);
-        let same_mounts = preopens_equal(&self.active_preopens, &preopens);
-        let mut sorted_hosts = network_hosts.to_vec();
-        sorted_hosts.sort();
-        sorted_hosts.dedup();
-        let same_network = self.active_network_hosts == sorted_hosts
-            && self.active_network_default == network_default;
-        // `if let Some(rt) = self.runtime.as_mut()` trips the borrow
-        // checker because a later branch reassigns `self.runtime`.
-        #[allow(clippy::unnecessary_unwrap)]
-        if same_home && same_mounts && same_network && self.runtime.is_some() {
-            return Ok(self.runtime.as_mut().unwrap());
-        }
-        // Drop any prior runtime before rebuilding against new state.
-        self.runtime = None;
-
-        // Auto-install on first use. Install is idempotent when the
-        // snapshot already exists (`force: false`).
-        if !is_installed(home) {
-            if !has_install_source(home) {
-                return Err(PyhlError::Preflight(ERR_NO_INSTALL_SOURCE.to_string()));
+    ) -> Result<(&mut Guest, Arc<Snapshot>), RunnerError> {
+        let same_config = self.active_home.as_deref() == Some(home)
+            && mounts_equal(&self.active_mounts, &mounts)
+            && self.active_network == network;
+        if !same_config {
+            // Host lists resolve names here, once per configuration, so a
+            // guest that is already up is not held to the resolver on
+            // every call.
+            let policy = Self::network_policy_from_key(&network)?;
+            // Nothing booted so far applies to the new configuration; the
+            // image still does, unless the home changed.
+            self.guest = None;
+            if self.active_home.as_deref() != Some(home) {
+                self.rewind = None;
             }
-            logger.log_line(&format!(
-                "hyperlight: no snapshot at {:?}; auto-installing from kernel + initrd",
-                home.join(SNAPSHOT_DIR)
-            ));
-            let kernel = home.join(KERNEL_FILE);
-            let initrd = home.join(INITRD_FILE);
-            let opts = pyhl::InstallOptions {
-                home,
-                source: pyhl::InstallSource::Explicit {
-                    kernel: &kernel,
-                    initrd: &initrd,
-                },
-                mounts: &preopens,
-                network: network.as_ref(),
-                listen_ports: None,
-                max_surrogates: None,
-                force: false,
-            };
-            let report = pyhl::install(&opts)
-                .map_err(|e| PyhlError::Runtime(format!("hyperlight install: {e:#}")))?;
-            logger.log_line(&format!(
-                "hyperlight: install complete (warmup={:.1}ms, snapshot at {:?})",
-                report.warmup_ms, report.snapshot
-            ));
+            self.active_home = Some(home.to_path_buf());
+            self.active_mounts = mounts;
+            self.active_policy = policy;
+            self.active_network = network;
         }
+        let rewind = match self.rewind.clone() {
+            Some(rewind) => rewind,
+            None => {
+                configure_surrogates();
+                let rewind = load_persisted_snapshot(home, logger)?;
+                self.rewind = Some(rewind.clone());
+                rewind
+            }
+        };
+        let guest = match self.guest.take() {
+            Some(guest) => guest,
+            None => {
+                configure_surrogates();
+                Self::boot_from_snapshot(rewind.clone(), &self.active_mounts, &self.active_policy)?
+            }
+        };
+        Ok((self.guest.insert(guest), rewind))
+    }
 
-        logger.log_line(&format!("hyperlight: using image home {home:?}"));
-        let rt = pyhl::Runtime::new(home, &preopens, network.as_ref(), None, None)
-            .map_err(|e| PyhlError::Runtime(format!("open hyperlight runtime: {e:#}")))?;
-        self.runtime = Some(rt);
-        self.active_home = Some(home.to_path_buf());
-        self.active_preopens = preopens;
-        self.active_network_hosts = sorted_hosts;
-        self.active_network_default = network_default;
-        Ok(self.runtime.as_mut().unwrap())
+    /// Restore the warm image into a new sandbox with `mounts` and
+    /// `policy`: the kernel builds its mount table from them on resume,
+    /// and the host serves them.
+    fn boot_from_snapshot(
+        rewind: Arc<Snapshot>,
+        mounts: &[Mount],
+        policy: &Option<hyperlight_unikraft::NetworkPolicy>,
+    ) -> Result<Guest, RunnerError> {
+        let builder = SandboxBuilder::from_snapshot(rewind).mounts(mounts.iter().cloned());
+        let sandbox = with_network(builder, policy)
+            .boot()
+            .map_err(|e| RunnerError::Runtime(format!("restore hyperlight snapshot: {e}")))?;
+        Ok(Guest {
+            sandbox,
+            fresh: true,
+        })
+    }
+
+    /// One hermetic call: rewind to the warmed state (unless the guest is
+    /// fresh from boot), run `code`, and report the guest's exit status.
+    fn run_once(
+        guest: &mut Guest,
+        rewind: &Arc<Snapshot>,
+        code: &str,
+        timeout: Option<Duration>,
+    ) -> Result<RunTiming, RunError> {
+        let mut timing = RunTiming::default();
+        if !guest.fresh {
+            let t = Instant::now();
+            guest
+                .sandbox
+                .restore(rewind.clone())
+                .map_err(|e| RunError::Failed(format!("rewind guest: {e}")))?;
+            timing.restore_ms = t.elapsed().as_secs_f64() * 1000.0;
+        }
+        guest.fresh = false;
+
+        let t = Instant::now();
+        let result = match timeout {
+            Some(timeout) => run_with_deadline(&mut guest.sandbox, code, timeout),
+            None => match guest.sandbox.run(code) {
+                Ok(()) => Ok(0),
+                Err(hyperlight_unikraft::Error::CallFailed { status }) => Ok(status),
+                Err(e) => Err(RunError::Failed(e.to_string())),
+            },
+        };
+        timing.call_ms = t.elapsed().as_secs_f64() * 1000.0;
+        // HostPrint already wrote the guest's output to our stdout; drop
+        // the copy the library keeps so it never grows across calls.
+        let _ = guest.sandbox.drain_output();
+
+        timing.exit_code = result?;
+        if timing.exit_code < 0 {
+            // The driver's own signal that it could not run the call; the
+            // guest's output has the details.
+            return Err(RunError::Failed(format!(
+                "the guest driver could not run the call (status {})",
+                timing.exit_code
+            )));
+        }
+        Ok(timing)
     }
 }
 
@@ -531,53 +694,30 @@ impl ScriptRunner for HyperlightScriptRunner {
                 return e.to_response();
             }
         };
-        let preopens = match Self::preopens_from_policy(request) {
-            Ok(p) => p,
+        let mounts = match Self::mounts_from_policy(request) {
+            Ok(m) => m,
             Err(e) => {
                 logger.log_line(&e.to_string());
                 return e.to_response();
             }
         };
-        let network = match Self::network_policy_from_request(request) {
-            Ok(n) => n,
-            Err(e) => {
-                logger.log_line(&e.to_string());
-                return e.to_response();
-            }
-        };
+        let (guest, rewind) =
+            match self.ensure_runtime(&home, mounts, NetworkKey::from_request(request), logger) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    logger.log_line(&e.to_string());
+                    return e.to_response();
+                }
+            };
 
-        let network_hosts = if !request.policy.allowed_hosts.is_empty() {
-            &request.policy.allowed_hosts
-        } else {
-            &request.policy.blocked_hosts
-        };
-        let rt = match self.ensure_runtime(
-            &home,
-            preopens,
-            network,
-            network_hosts,
-            request.policy.default_network_policy.clone(),
-            logger,
-        ) {
-            Ok(rt) => rt,
-            Err(e) => {
-                logger.log_line(&e.to_string());
-                return e.to_response();
-            }
-        };
-
-        let result = if request.script_timeout > 0 {
-            let timeout = std::time::Duration::from_millis(u64::from(request.script_timeout));
+        let timeout = (request.script_timeout > 0).then(|| {
             logger.log_line(&format!(
                 "hyperlight: timeout set to {}ms",
                 request.script_timeout
             ));
-            rt.run_code_with_timeout(&request.script_code, timeout)
-        } else {
-            rt.run_code(&request.script_code)
-        };
-
-        match result {
+            Duration::from_millis(u64::from(request.script_timeout))
+        });
+        match Self::run_once(guest, &rewind, &request.script_code, timeout) {
             Ok(timing) => {
                 logger.log_line(&format!(
                     "hyperlight: run ok (restore={:.1}ms call={:.1}ms exit={})",
@@ -588,8 +728,18 @@ impl ScriptRunner for HyperlightScriptRunner {
                     ..Default::default()
                 }
             }
-            Err(e) => {
-                let err = PyhlError::Runtime(format!("run_code: {e:#}"));
+            Err(failure) => {
+                // The guest is mid-call (blocked, killed, exited or
+                // deadlocked): nothing more will run in it. Drop it; the
+                // next call boots another from the rewind point.
+                self.guest = None;
+                let err = match failure {
+                    RunError::TimedOut(timeout) => RunnerError::Runtime(format!(
+                        "execution timed out after {:.1}s",
+                        timeout.as_secs_f64()
+                    )),
+                    RunError::Failed(msg) => RunnerError::Runtime(format!("run: {msg}")),
+                };
                 logger.log_line(&err.to_string());
                 err.to_response()
             }
@@ -597,18 +747,368 @@ impl ScriptRunner for HyperlightScriptRunner {
     }
 }
 
-// -- Helpers -----------------------------------------------------------------
+// -- Guest driving -----------------------------------------------------------
 
-/// A home has a warmed snapshot (plus kernel + initrd) — ready to load.
-fn is_installed(home: &Path) -> bool {
-    home.join(KERNEL_FILE).is_file()
-        && home.join(INITRD_FILE).is_file()
-        && home.join(SNAPSHOT_DIR).join("index.json").is_file()
+/// Run `code` and wait for it, giving up at `timeout`.
+///
+/// The guest hands the vCPU back whenever every thread is blocked, so a
+/// sleeping script is caught by bounding each `step`. A script that never
+/// blocks (a busy loop) holds the vCPU inside one entry, which only an
+/// interrupt from another thread can end; the watchdog fires it at the
+/// deadline, and keeps firing until this thread confirms it is out, in
+/// case the guest was between entries the first time. An interrupted
+/// sandbox is poisoned, a merely blocked one still has the call in
+/// flight: the caller discards the guest either way.
+fn run_with_deadline(
+    sandbox: &mut AppSandbox,
+    code: &str,
+    timeout: Duration,
+) -> Result<i32, RunError> {
+    let deadline = Instant::now() + timeout;
+    // Dropped by this thread once the call is over, however it ended,
+    // which wakes the watchdog at once instead of on its next tick.
+    let (finished_tx, finished_rx) = mpsc::channel::<()>();
+    let watchdog = {
+        let handle = sandbox.interrupt_handle();
+        std::thread::spawn(move || {
+            let mut wait = deadline.saturating_duration_since(Instant::now());
+            loop {
+                match finished_rx.recv_timeout(wait) {
+                    Err(RecvTimeoutError::Timeout) => {}
+                    // The call is over: finished before the deadline, or
+                    // the caller is gone.
+                    _ => return,
+                }
+                // Past the deadline. `kill` breaks an entry in progress;
+                // between entries (in a host call, say) it only marks the
+                // next one cancelled and reports nothing, so retry until
+                // the call is over either way.
+                if handle.kill() {
+                    return;
+                }
+                wait = Duration::from_millis(10);
+            }
+        })
+    };
+
+    let outcome = drive_until(sandbox, code, deadline);
+    drop(finished_tx);
+    let _ = watchdog.join();
+
+    match outcome {
+        Ok(Some(status)) => Ok(status),
+        Ok(None) => Err(RunError::TimedOut(timeout)),
+        // Only the watchdog kills this sandbox, and Hyperlight clears a
+        // kill at the start of every entry, so a cancelled entry is this
+        // call's timeout however the kill landed.
+        Err(hyperlight_unikraft::Error::Hyperlight(HyperlightError::ExecutionCanceledByHost())) => {
+            Err(RunError::TimedOut(timeout))
+        }
+        Err(e) => Err(RunError::Failed(e.to_string())),
+    }
 }
 
-/// A home has the raw inputs we need to auto-install a snapshot.
+/// Submit `code` and step the guest until the call returns (`Some(status)`)
+/// or `deadline` passes (`None`).
+fn drive_until(
+    sandbox: &mut AppSandbox,
+    code: &str,
+    deadline: Instant,
+) -> Result<Option<i32>, hyperlight_unikraft::Error> {
+    sandbox.submit(code)?;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        match sandbox.step(remaining)? {
+            Yield::CallDone => return Ok(Some(0)),
+            Yield::CallFailed { status } => return Ok(Some(status)),
+            Yield::Exited { status } => {
+                return Err(hyperlight_unikraft::Error::GuestExited { status })
+            }
+            Yield::Blocked { .. } => {}
+        }
+    }
+}
+
+// -- Install -----------------------------------------------------------------
+
+/// Boot the rootfs in `home` without mounts, snapshot the warmed guest to
+/// `home/snapshot` (replacing any snapshot there), and hand it back.
+/// Boot the rootfs in `home`, save the warm image beside its snapshot
+/// directory and publish it there. The flag says whether the new layout
+/// is what now sits in the snapshot directory; when it is not, the image
+/// in memory is still this warm's and the log says what happened on disk.
+fn warm_snapshot(home: &Path, logger: &mut Logger) -> Result<(Arc<Snapshot>, bool), RunnerError> {
+    let snapshot_dir = home.join(SNAPSHOT_DIR);
+    logger.log_line(&format!(
+        "hyperlight: booting {:?} to warm a snapshot",
+        home.join(INITRD_FILE)
+    ));
+    let t = Instant::now();
+    configure_surrogates();
+    let mut sandbox = rootfs_builder(home)
+        .boot()
+        .map_err(|e| RunnerError::Runtime(format!("boot hyperlight rootfs: {e}")))?;
+    // Saved beside the snapshot directory, so a failed save leaves whatever
+    // is there standing, then published by rename.
+    let staged = home.join(format!(".{SNAPSHOT_DIR}.{}.part", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staged);
+    let snapshot = match sandbox.snapshot_to(&staged) {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staged);
+            return Err(RunnerError::Runtime(format!(
+                "save snapshot to {staged:?}: {e}"
+            )));
+        }
+    };
+    let persisted = publish_snapshot(home, &staged, &snapshot_dir, logger);
+    logger.log_line(&format!(
+        "hyperlight: warm-up took {:.1}ms; snapshot at {snapshot_dir:?}",
+        t.elapsed().as_secs_f64() * 1000.0
+    ));
+    Ok((snapshot, persisted))
+}
+
+/// Move the layout saved at `staged` into `snapshot_dir`: the old layout is
+/// set aside by rename first and dropped only once the new one is in place,
+/// so the directory is absent only between two renames. Two warms at once
+/// each save a whole layout, and the one whose move lands is the one that
+/// stays. Returns whether a fresh layout is now in place: this warm's, or
+/// another warm's that landed first. Otherwise the old layout is back, or,
+/// if it could not be put back either, left at its `.old` path, which the
+/// log names.
+fn publish_snapshot(home: &Path, staged: &Path, snapshot_dir: &Path, logger: &mut Logger) -> bool {
+    let old = home.join(format!(".{SNAPSHOT_DIR}.{}.old", std::process::id()));
+    let had_old = match std::fs::rename(snapshot_dir, &old) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            logger.log_line(&format!(
+                "hyperlight: set aside old snapshot {snapshot_dir:?}: {e}"
+            ));
+            let _ = std::fs::remove_dir_all(staged);
+            return false;
+        }
+    };
+    let moved = std::fs::rename(staged, snapshot_dir);
+    if let Err(e) = &moved {
+        logger.log_line(&format!(
+            "hyperlight: move snapshot into place at {snapshot_dir:?}: {e}"
+        ));
+        let _ = std::fs::remove_dir_all(staged);
+    }
+    match (moved, had_old) {
+        (Ok(()), true) => {
+            let _ = std::fs::remove_dir_all(&old);
+            true
+        }
+        (Ok(()), false) => true,
+        (Err(_), true) => {
+            if std::fs::rename(&old, snapshot_dir).is_ok() {
+                logger.log_line(&format!(
+                    "hyperlight: old snapshot put back at {snapshot_dir:?}"
+                ));
+                return false;
+            }
+            if hyperlight_unikraft::load_snapshot(snapshot_dir).is_ok() {
+                // Another warm landed in the meantime; its layout stays.
+                logger.log_line(&format!(
+                    "hyperlight: another warm published {snapshot_dir:?} first"
+                ));
+                let _ = std::fs::remove_dir_all(&old);
+                return true;
+            }
+            logger.log_line(&format!("hyperlight: old snapshot left at {old:?}"));
+            false
+        }
+        (Err(_), false) => {
+            let landed = hyperlight_unikraft::load_snapshot(snapshot_dir).is_ok();
+            if landed {
+                logger.log_line(&format!(
+                    "hyperlight: another warm published {snapshot_dir:?} first"
+                ));
+            }
+            landed
+        }
+    }
+}
+
+/// The persisted snapshot in `home`, warming and persisting one first
+/// when there is none this build loads.
+fn load_persisted_snapshot(home: &Path, logger: &mut Logger) -> Result<Arc<Snapshot>, RunnerError> {
+    let snapshot_dir = home.join(SNAPSHOT_DIR);
+    let unloadable = match hyperlight_unikraft::load_snapshot(&snapshot_dir) {
+        Ok(snapshot) => {
+            logger.log_line(&format!("hyperlight: using image home {home:?}"));
+            return Ok(snapshot);
+        }
+        Err(e) => e,
+    };
+    if !has_install_source(home) {
+        return Err(RunnerError::Preflight(ERR_NO_INSTALL_SOURCE.to_string()));
+    }
+    logger.log_line(&match unloadable {
+        hyperlight_unikraft::Error::SnapshotRelease { saved_by, .. } => format!(
+            "hyperlight: the snapshot at {snapshot_dir:?} was saved by hyperlight-unikraft \
+             {saved_by}; warming one for this build from the rootfs"
+        ),
+        e => format!(
+            "hyperlight: no snapshot to load at {snapshot_dir:?} ({e}); warming one from the \
+             rootfs"
+        ),
+    });
+    let (snapshot, persisted) = warm_snapshot(home, logger)?;
+    if !persisted {
+        logger.log_line(
+            "hyperlight: running from the warm image in memory; the next run warms again",
+        );
+    }
+    Ok(snapshot)
+}
+
+/// A builder for a fresh boot of the rootfs in `home`.
+fn rootfs_builder(home: &Path) -> SandboxBuilder {
+    SandboxBuilder::from_initrd(home.join(INITRD_FILE)).scratch_mb(SCRATCH_MB)
+}
+
+fn with_network(
+    builder: SandboxBuilder,
+    policy: &Option<hyperlight_unikraft::NetworkPolicy>,
+) -> SandboxBuilder {
+    match policy {
+        Some(policy) => builder.network(policy.clone()),
+        None => builder,
+    }
+}
+
+/// Pull the rootfs CPIO out of the published image into `dst`, staged
+/// beside it and renamed into place so a failed pull leaves no
+/// half-written rootfs.
+fn pull_rootfs(dst: &Path, logger: &mut Logger) -> Result<(), String> {
+    use std::process::Command;
+
+    let tool = find_on_path(&["docker", "podman"]).ok_or_else(|| {
+        format!(
+            "neither docker nor podman is on $PATH; install one, or drop `{INITRD_FILE}` \
+             into the image home by hand"
+        )
+    })?;
+    let image = format!("{ROOTFS_IMAGE}:{ROOTFS_TAG}");
+    let run = |cmd: &mut Command, label: &str| -> Result<(), String> {
+        let out = cmd
+            .output()
+            .map_err(|e| format!("spawn {tool} {label}: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "{tool} {label} failed (exit {:?}): {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(())
+    };
+
+    logger.log_line(&format!("hyperlight setup: {tool} pull {image}"));
+    run(Command::new(tool).args(["pull", &image]), "pull")?;
+
+    let cname = format!("mxc-hyperlight-rootfs-{}", std::process::id());
+    let _ = Command::new(tool).args(["rm", "-f", &cname]).output();
+    // A scratch image has no command, and `create` insists on one; any
+    // string does, the container is never started.
+    run(
+        Command::new(tool).args(["create", "--name", &cname, &image, "/"]),
+        "create",
+    )?;
+    let _cleanup = ContainerCleanup {
+        tool,
+        cname: &cname,
+    };
+
+    let staged = dst.with_file_name(format!(".{INITRD_FILE}.part"));
+    let staged_str = staged
+        .to_str()
+        .ok_or_else(|| format!("image home path {staged:?} is not valid UTF-8"))?;
+    run(
+        Command::new(tool).args(["cp", &format!("{cname}:{ROOTFS_PATH_IN_IMAGE}"), staged_str]),
+        "cp",
+    )?;
+    std::fs::rename(&staged, dst).map_err(|e| format!("move rootfs into place at {dst:?}: {e}"))
+}
+
+/// Removes the extraction container on drop, success or failure.
+struct ContainerCleanup<'a> {
+    tool: &'a str,
+    cname: &'a str,
+}
+
+impl Drop for ContainerCleanup<'_> {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new(self.tool)
+            .args(["rm", "-f", self.cname])
+            .output();
+    }
+}
+
+/// Return the first name in `names` present as an executable on `$PATH`.
+fn find_on_path(names: &[&'static str]) -> Option<&'static str> {
+    let path = std::env::var_os("PATH")?;
+    names.iter().copied().find(|name| {
+        std::env::split_paths(&path).any(|dir| {
+            let candidate = dir.join(name);
+            let Ok(md) = candidate.metadata() else {
+                return false;
+            };
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                md.is_file() && md.permissions().mode() & 0o111 != 0
+            }
+            #[cfg(not(unix))]
+            {
+                md.is_file()
+            }
+        })
+    })
+}
+
+/// One guest per process: the runner holds at most one sandbox, and the
+/// warm boot is dropped before the restore boots, so Hyperlight's
+/// single-VM mode fits and skips its 512 pre-spawned helper processes on
+/// Windows (about 3.5 s on first boot). Must run before any sandbox
+/// exists; later calls are no-ops.
+fn configure_surrogates() {
+    #[cfg(windows)]
+    hyperlight_unikraft::configure_surrogates(0);
+}
+
+// -- Helpers -----------------------------------------------------------------
+
+/// A home has a snapshot this build loads, beside no rootfs of another
+/// release. The rootfs is only needed to warm, not to run.
+fn is_installed(home: &Path) -> bool {
+    stamp_matches(home) && hyperlight_unikraft::load_snapshot(home.join(SNAPSHOT_DIR)).is_ok()
+}
+
+/// A home has a rootfs of this release — enough to warm a snapshot from.
+/// A rootfs with no stamp (dropped in by hand) is taken on trust; one
+/// stamped for another release is not, since it will not boot on this
+/// release's kernel.
 fn has_install_source(home: &Path) -> bool {
-    home.join(KERNEL_FILE).is_file() && home.join(INITRD_FILE).is_file()
+    home.join(INITRD_FILE).is_file() && stamp_matches(home)
+}
+
+fn version_stamp() -> String {
+    format!("rootfs: {ROOTFS_IMAGE}:{ROOTFS_TAG}\n")
+}
+
+fn stamp_matches(home: &Path) -> bool {
+    match std::fs::read_to_string(home.join(VERSION_FILE)) {
+        Ok(stamp) => stamp.trim() == version_stamp().trim(),
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 /// Paths equal after canonicalization (best-effort).
@@ -618,13 +1118,11 @@ fn same_path(a: &str, b: &str) -> bool {
     ap == bp
 }
 
-fn preopens_equal(a: &[Preopen], b: &[Preopen]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter()
-        .zip(b.iter())
-        .all(|(x, y)| x.host_dir == y.host_dir && x.guest_path == y.guest_path)
+fn mounts_equal(a: &[Mount], b: &[Mount]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b.iter()).all(|(x, y)| {
+            x.host_path == y.host_path && x.guest_path == y.guest_path && x.readonly == y.readonly
+        })
 }
 
 /// OS-local data directory (the "user Application Data" root).
@@ -671,25 +1169,40 @@ mod tests {
         HyperlightScriptRunner::new()
     }
 
-    #[test]
-    fn is_installed_false_on_empty_dir() {
-        let tmp = std::env::temp_dir().join(format!("hl-runner-test-{}", std::process::id()));
+    fn fresh_tmp(tag: &str) -> PathBuf {
+        let tmp = std::env::temp_dir().join(format!("hl-runner-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
-        assert!(!is_installed(&tmp));
-        assert!(!has_install_source(&tmp));
+        tmp
     }
 
     #[test]
-    fn has_install_source_true_when_kernel_and_initrd_present() {
-        let tmp =
-            std::env::temp_dir().join(format!("hl-runner-install-src-{}", std::process::id()));
+    fn is_installed_false_on_empty_dir() {
+        let tmp = fresh_tmp("empty");
+        assert!(!is_installed(&tmp));
+        assert!(!has_install_source(&tmp));
         let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        std::fs::write(tmp.join(KERNEL_FILE), b"").unwrap();
+    }
+
+    #[test]
+    fn has_install_source_true_when_rootfs_present() {
+        let tmp = fresh_tmp("install-src");
         std::fs::write(tmp.join(INITRD_FILE), b"").unwrap();
         assert!(has_install_source(&tmp));
         assert!(!is_installed(&tmp)); // snapshot still absent
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn rootfs_stamped_for_another_release_is_not_an_install_source() {
+        let tmp = fresh_tmp("stale");
+        std::fs::write(tmp.join(INITRD_FILE), b"").unwrap();
+        std::fs::write(tmp.join(VERSION_FILE), "pyhl 0.12.1\n").unwrap();
+        assert!(!has_install_source(&tmp));
+        assert!(!is_installed(&tmp));
+
+        std::fs::write(tmp.join(VERSION_FILE), version_stamp()).unwrap();
+        assert!(has_install_source(&tmp));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -699,9 +1212,7 @@ mod tests {
         // test machine: PYHL_HOME, XDG_DATA_HOME (Linux), LOCALAPPDATA
         // (Windows), HOME/USERPROFILE all get pointed into an empty
         // tmpdir for the duration of this test.
-        let empty = std::env::temp_dir().join(format!("hl-resolve-empty-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&empty);
-        std::fs::create_dir_all(&empty).unwrap();
+        let empty = fresh_tmp("resolve-empty");
 
         let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
             PYHL_HOME_ENV,
@@ -745,11 +1256,10 @@ mod tests {
     }
 
     #[test]
-    fn policy_accepts_readwrite_paths_and_builds_preopens() {
+    fn policy_accepts_readwrite_paths_and_builds_mounts() {
         // We can't end-to-end test without a real image; just verify
-        // the policy→Preopen mapping.
-        let tmp = std::env::temp_dir().join(format!("hl-mount-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        // the policy→Mount mapping.
+        let tmp = fresh_tmp("mount");
         let request = ExecutionRequest {
             policy: ContainerPolicy {
                 readwrite_paths: vec![tmp.to_string_lossy().to_string()],
@@ -757,12 +1267,30 @@ mod tests {
             },
             ..Default::default()
         };
-        let preopens = HyperlightScriptRunner::preopens_from_policy(&request).unwrap();
-        assert_eq!(preopens.len(), 1);
+        let mounts = HyperlightScriptRunner::mounts_from_policy(&request).unwrap();
+        assert_eq!(mounts.len(), 1);
         assert_eq!(
-            preopens[0].guest_path,
+            mounts[0].guest_path,
             format!("/host/{}", tmp.file_name().unwrap().to_string_lossy())
         );
+        assert!(!mounts[0].readonly);
+        assert_eq!(mounts[0].host_path, std::fs::canonicalize(&tmp).unwrap());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn policy_marks_readonly_paths() {
+        let tmp = fresh_tmp("mount-ro");
+        let request = ExecutionRequest {
+            policy: ContainerPolicy {
+                readonly_paths: vec![tmp.to_string_lossy().to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mounts = HyperlightScriptRunner::mounts_from_policy(&request).unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert!(mounts[0].readonly);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -782,13 +1310,32 @@ mod tests {
             },
             ..Default::default()
         };
-        let err = HyperlightScriptRunner::preopens_from_policy(&request).unwrap_err();
+        let err = HyperlightScriptRunner::mounts_from_policy(&request).unwrap_err();
         assert!(
             err.to_string().contains("collide on guest path"),
             "got: {err}"
         );
         let _ = std::fs::remove_dir_all(a.parent().unwrap());
         let _ = std::fs::remove_dir_all(b.parent().unwrap());
+    }
+
+    #[test]
+    fn policy_rejects_mount_name_the_kernel_cannot_carry() {
+        let tmp = fresh_tmp("mount-bad").join("with space");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let request = ExecutionRequest {
+            policy: ContainerPolicy {
+                readwrite_paths: vec![tmp.to_string_lossy().to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = HyperlightScriptRunner::mounts_from_policy(&request).unwrap_err();
+        assert!(
+            err.to_string().contains("may not contain whitespace"),
+            "got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
     }
 
     #[test]
@@ -810,6 +1357,32 @@ mod tests {
     }
 
     #[test]
+    fn network_key_tells_an_allow_list_from_a_block_list() {
+        let allow = ExecutionRequest {
+            policy: ContainerPolicy {
+                allowed_hosts: vec!["a.example".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let block = ExecutionRequest {
+            policy: ContainerPolicy {
+                blocked_hosts: vec!["a.example".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_ne!(
+            NetworkKey::from_request(&allow),
+            NetworkKey::from_request(&block)
+        );
+        assert_eq!(
+            NetworkKey::from_request(&allow),
+            NetworkKey::from_request(&allow)
+        );
+    }
+
+    #[test]
     fn network_policy_allow_all_when_default_allow() {
         let request = ExecutionRequest {
             policy: ContainerPolicy {
@@ -818,7 +1391,9 @@ mod tests {
             },
             ..Default::default()
         };
-        let policy = HyperlightScriptRunner::network_policy_from_request(&request).unwrap();
+        let policy =
+            HyperlightScriptRunner::network_policy_from_key(&NetworkKey::from_request(&request))
+                .unwrap();
         assert!(matches!(
             policy,
             Some(hyperlight_unikraft::NetworkPolicy::AllowAll)
@@ -834,7 +1409,9 @@ mod tests {
             },
             ..Default::default()
         };
-        let policy = HyperlightScriptRunner::network_policy_from_request(&request).unwrap();
+        let policy =
+            HyperlightScriptRunner::network_policy_from_key(&NetworkKey::from_request(&request))
+                .unwrap();
         assert!(matches!(
             policy,
             Some(hyperlight_unikraft::NetworkPolicy::AllowList(_))
@@ -850,7 +1427,9 @@ mod tests {
             },
             ..Default::default()
         };
-        let policy = HyperlightScriptRunner::network_policy_from_request(&request).unwrap();
+        let policy =
+            HyperlightScriptRunner::network_policy_from_key(&NetworkKey::from_request(&request))
+                .unwrap();
         assert!(policy.is_none());
     }
 
@@ -863,7 +1442,9 @@ mod tests {
             },
             ..Default::default()
         };
-        let policy = HyperlightScriptRunner::network_policy_from_request(&request).unwrap();
+        let policy =
+            HyperlightScriptRunner::network_policy_from_key(&NetworkKey::from_request(&request))
+                .unwrap();
         assert!(matches!(
             policy,
             Some(hyperlight_unikraft::NetworkPolicy::BlockList(_))

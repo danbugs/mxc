@@ -69,8 +69,8 @@ struct Cli {
     log_file: Option<String>,
 
     /// Install the warmed Hyperlight snapshot and exit. Pulls the
-    /// published kernel + initrd from GHCR (via docker or podman),
-    /// warms them up, and writes the snapshot into the default user
+    /// published rootfs from GHCR (via docker or podman), boots it
+    /// once, and writes the snapshot into the default user
     /// data dir (~/.local/share/pyhl on Linux, %LOCALAPPDATA%\pyhl on
     /// Windows). $PYHL_HOME overrides the destination if set. Intended
     /// for tool install hooks so first-run has zero warmup cost.
@@ -78,8 +78,8 @@ struct Cli {
     setup_hyperlight: bool,
 
     /// Rebuild the snapshot even if one already exists. Use after
-    /// upgrading `kernel` or `initrd.cpio` so the warm state matches
-    /// the new bits. Requires --setup-hyperlight.
+    /// replacing `initrd.cpio` so the warm state matches the new
+    /// bits. Requires --setup-hyperlight.
     #[arg(long, requires = "setup_hyperlight")]
     force: bool,
 
@@ -1013,7 +1013,7 @@ fn main() {
             output.probes.isolation_session_available = mxc_engine::isolation_session_available();
             output
         };
-        // WHP is delay-loaded; check before pyhl::install warms a VM.
+        // WHP is delay-loaded; check before setup boots a VM.
         #[cfg(all(target_os = "windows", feature = "hyperlight", target_arch = "x86_64"))]
         let output = {
             let mut output = output;
@@ -1064,7 +1064,7 @@ fn main() {
     if cli.setup_hyperlight {
         #[cfg(all(feature = "hyperlight", target_arch = "x86_64"))]
         {
-            // WHP is delay-loaded; check before pyhl::install warms a VM.
+            // WHP is delay-loaded; check before setup boots a VM.
             #[cfg(target_os = "windows")]
             if !hyperlight_common::is_whp_available() {
                 eprintln!(
