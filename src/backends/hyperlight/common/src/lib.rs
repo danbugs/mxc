@@ -30,11 +30,11 @@
 //!
 //! The runner looks for a warmed image in this order, first hit wins:
 //!
-//!   1. `$PYHL_HOME` (searched first when set)
-//!   2. `~/.local/share/pyhl/` on Linux (XDG_DATA_HOME compliant)
-//!      `%LOCALAPPDATA%\pyhl\` on Windows
-//!   3. `<exe_dir>/pyhl/` (dev build next to the target binary)
-//!   4. `<cwd>/.pyhl/` (dev fallback)
+//!   1. `$MXC_HYPERLIGHT_HOME` (searched first when set)
+//!   2. `~/.local/share/mxc-hyperlight/` on Linux (XDG_DATA_HOME compliant)
+//!      `%LOCALAPPDATA%\mxc-hyperlight\` on Windows
+//!   3. `<exe_dir>/mxc-hyperlight/` (dev build next to the target binary)
+//!   4. `<cwd>/.mxc-hyperlight/` (dev fallback)
 //!
 //! Path #2 is the "default". `--setup-hyperlight` installs here when nothing
 //! else is already populated — so one eager install persists across
@@ -164,15 +164,15 @@ const ERROR_EXIT_CODE: i32 = -1;
 
 /// Env var override for the Hyperlight image home. Set this to force a
 /// specific location; otherwise the runner uses a standard OS-local
-/// data path (~/.local/share/pyhl on Linux, %LOCALAPPDATA%\pyhl on
+/// data path (~/.local/share/mxc-hyperlight on Linux, %LOCALAPPDATA%\mxc-hyperlight on
 /// Windows).
-const PYHL_HOME_ENV: &str = "PYHL_HOME";
+const HOME_ENV: &str = "MXC_HYPERLIGHT_HOME";
 /// Subdirectory used next to the running executable (dev builds).
-const EXE_RELATIVE_HOME: &str = "pyhl";
+const EXE_RELATIVE_HOME: &str = "mxc-hyperlight";
 /// Subdirectory used in the cwd as a last resort (dev fallback).
-const CWD_RELATIVE_HOME: &str = ".pyhl";
+const CWD_RELATIVE_HOME: &str = ".mxc-hyperlight";
 /// Final component of the default OS-local data path.
-const DEFAULT_HOME_LEAF: &str = "pyhl";
+const DEFAULT_HOME_LEAF: &str = "mxc-hyperlight";
 
 /// The guest rootfs (a CPIO archive) inside an image home. The kernel is
 /// embedded in the `hyperlight-unikraft` crate, so this is the only
@@ -289,10 +289,10 @@ impl Default for HyperlightScriptRunner {
 ///
 /// # Destination
 ///
-/// `$PYHL_HOME` if set, otherwise the OS-local default
-/// (`~/.local/share/pyhl` on Linux, `%LOCALAPPDATA%\pyhl` on
+/// `$MXC_HYPERLIGHT_HOME` if set, otherwise the OS-local default
+/// (`~/.local/share/mxc-hyperlight` on Linux, `%LOCALAPPDATA%\mxc-hyperlight` on
 /// Windows). We intentionally do NOT walk the runtime search chain
-/// here — that would let a stale `<cwd>/.pyhl/` from an old dev
+/// here — that would let a stale `<cwd>/.mxc-hyperlight/` from an old dev
 /// session short-circuit the install and leave the default home
 /// empty, which would make later runs from a different cwd fail.
 ///
@@ -302,7 +302,7 @@ impl Default for HyperlightScriptRunner {
 /// no-op; one left by another release is rebuilt. When `force` is true,
 /// the snapshot is rebuilt regardless.
 pub fn setup(force: bool, logger: &mut Logger) -> Result<PathBuf, String> {
-    let home = match std::env::var_os(PYHL_HOME_ENV) {
+    let home = match std::env::var_os(HOME_ENV) {
         Some(v) => PathBuf::from(v),
         None => HyperlightScriptRunner::default_home(),
     };
@@ -382,7 +382,7 @@ impl HyperlightScriptRunner {
             ),
         };
         Err(RunnerError::Preflight(format!(
-            "no hyperlight image found. searched ${PYHL_HOME_ENV}, {default:?}, \
+            "no hyperlight image found. searched ${HOME_ENV}, {default:?}, \
              <exe>/{EXE_RELATIVE_HOME}/, <cwd>/{CWD_RELATIVE_HOME}/. {hint}"
         )))
     }
@@ -390,7 +390,7 @@ impl HyperlightScriptRunner {
     /// Candidate locations, in priority order.
     fn search_paths() -> Vec<PathBuf> {
         let mut paths = Vec::with_capacity(4);
-        if let Some(explicit) = std::env::var_os(PYHL_HOME_ENV) {
+        if let Some(explicit) = std::env::var_os(HOME_ENV) {
             paths.push(PathBuf::from(explicit));
         }
         paths.push(Self::default_home());
@@ -407,10 +407,10 @@ impl HyperlightScriptRunner {
 
     /// The OS-local default data directory. Setup writes here
     /// when nothing else is already populated, and it's always second
-    /// in the resolution chain (after $PYHL_HOME).
+    /// in the resolution chain (after $MXC_HYPERLIGHT_HOME).
     ///
-    /// - Linux: `$XDG_DATA_HOME/pyhl` (or `~/.local/share/pyhl`)
-    /// - Windows: `%LOCALAPPDATA%\pyhl` (or `~\AppData\Local\pyhl`)
+    /// - Linux: `$XDG_DATA_HOME/mxc-hyperlight` (or `~/.local/share/mxc-hyperlight`)
+    /// - Windows: `%LOCALAPPDATA%\mxc-hyperlight` (or `~\AppData\Local\mxc-hyperlight`)
     fn default_home() -> PathBuf {
         os_data_home().join(DEFAULT_HOME_LEAF)
     }
@@ -1132,7 +1132,7 @@ fn mounts_equal(a: &[Mount], b: &[Mount]) -> bool {
 ///
 /// Returns `PathBuf::from(".")` if no candidate env vars are set (degrades
 /// gracefully rather than panicking; caller can still override via
-/// `$PYHL_HOME`).
+/// `$MXC_HYPERLIGHT_HOME`).
 fn os_data_home() -> PathBuf {
     #[cfg(windows)]
     {
@@ -1197,7 +1197,12 @@ mod tests {
     fn rootfs_stamped_for_another_release_is_not_an_install_source() {
         let tmp = fresh_tmp("stale");
         std::fs::write(tmp.join(INITRD_FILE), b"").unwrap();
-        std::fs::write(tmp.join(VERSION_FILE), "pyhl 0.12.1\n").unwrap();
+        // A stamp from an earlier release than ROOTFS_TAG names.
+        std::fs::write(
+            tmp.join(VERSION_FILE),
+            format!("rootfs: {ROOTFS_IMAGE}:initrd-v0.13.0\n"),
+        )
+        .unwrap();
         assert!(!has_install_source(&tmp));
         assert!(!is_installed(&tmp));
 
@@ -1209,13 +1214,13 @@ mod tests {
     #[test]
     fn resolve_home_errors_when_nothing_configured() {
         // Redirect every candidate away from any real install on the
-        // test machine: PYHL_HOME, XDG_DATA_HOME (Linux), LOCALAPPDATA
+        // test machine: MXC_HYPERLIGHT_HOME, XDG_DATA_HOME (Linux), LOCALAPPDATA
         // (Windows), HOME/USERPROFILE all get pointed into an empty
         // tmpdir for the duration of this test.
         let empty = fresh_tmp("resolve-empty");
 
         let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
-            PYHL_HOME_ENV,
+            HOME_ENV,
             "XDG_DATA_HOME",
             "HOME",
             "LOCALAPPDATA",

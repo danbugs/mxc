@@ -75,18 +75,18 @@ jobs:
         if: steps.whp-check.outputs.whp_available == 'true'
         shell: pwsh
         run: |
-          $pyhlHome = Join-Path $env:LOCALAPPDATA "pyhl"
-          New-Item -ItemType Directory -Force -Path $pyhlHome | Out-Null
+          $hlHome = Join-Path $env:LOCALAPPDATA "mxc-hyperlight"
+          New-Item -ItemType Directory -Force -Path $hlHome | Out-Null
 
           # The Unikraft kernel is embedded in the hyperlight-unikraft crate; only
           # the agent rootfs (initrd.cpio) is fetched, pinned to the crate release
           # declared in src/backends/hyperlight/common/Cargo.toml.
           $tag = "initrd-v0.14.1"
           .\crane.exe export ghcr.io/hyperlight-dev/hyperlight-unikraft/agent:$tag initrd.tar
-          tar -xf initrd.tar -C $pyhlHome initrd.cpio
+          tar -xf initrd.tar -C $hlHome initrd.cpio
 
-          Write-Host "Downloaded to ${pyhlHome}:"
-          Get-ChildItem $pyhlHome
+          Write-Host "Downloaded to ${hlHome}:"
+          Get-ChildItem $hlHome
 
       - name: Warm Hyperlight snapshot
         if: steps.whp-check.outputs.whp_available == 'true'
@@ -101,7 +101,7 @@ jobs:
             exit 1
           }
           Write-Host "Snapshot created:"
-          Get-ChildItem (Join-Path $env:LOCALAPPDATA "pyhl")
+          Get-ChildItem (Join-Path $env:LOCALAPPDATA "mxc-hyperlight")
 
       - name: Run Hyperlight E2E Tests
         if: steps.whp-check.outputs.whp_available == 'true'

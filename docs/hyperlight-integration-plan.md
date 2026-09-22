@@ -91,8 +91,10 @@ C/C++, PowerShell, and Bash/Shell runtimes.
 
 5. **Image artifacts are user-provided, not bundled.** The `--setup-hyperlight`
    flag populates the image home. The runner auto-discovers
-   `$PYHL_HOME` → `<exe>/pyhl/` → `<cwd>/.pyhl/`; the first location
-   with all three files wins.
+   `$MXC_HYPERLIGHT_HOME` → `~/.local/share/mxc-hyperlight/` (or
+   `%LOCALAPPDATA%\mxc-hyperlight\`) → `<exe>/mxc-hyperlight/` →
+   `<cwd>/.mxc-hyperlight/`; the first location holding the rootfs and a
+   snapshot of this build wins.
 
 6. **Exit codes.** 0 on clean completion of `run_code`; -1 on any error
    (preflight, runtime, guest crash). Distinct per-error variants go
