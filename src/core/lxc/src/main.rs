@@ -64,11 +64,12 @@ struct Cli {
     log_file: Option<String>,
 
     /// Install the warmed Hyperlight snapshot and exit. Pulls the
-    /// published rootfs from GHCR (via docker or podman), boots it
-    /// once, and writes the snapshot into the default user
-    /// data dir (~/.local/share/mxc-hyperlight on Linux, %LOCALAPPDATA%\mxc-hyperlight on
-    /// Windows). $MXC_HYPERLIGHT_HOME overrides the destination if set. Intended
-    /// for tool install hooks so first-run has zero warmup cost.
+    /// published rootfs from GHCR unless the image home already holds
+    /// it, boots it once, and writes the snapshot into the default user
+    /// data dir (~/.local/share/mxc-hyperlight on Linux,
+    /// %LOCALAPPDATA%\mxc-hyperlight on Windows). $MXC_HYPERLIGHT_HOME
+    /// overrides the destination if set. Intended for tool install hooks
+    /// so first-run has zero warmup cost.
     #[arg(long = "setup-hyperlight")]
     setup_hyperlight: bool,
 

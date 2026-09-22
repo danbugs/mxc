@@ -53,9 +53,9 @@
 //! ## Setup
 //!
 //! `lxc-exec --setup-hyperlight` (or `wxc-exec --setup-hyperlight`) pulls
-//! the published `agent` rootfs from GHCR via docker or podman, boots it
-//! once, and persists the warmed guest as a snapshot in the default home —
-//! zero configuration beyond having docker/podman on `$PATH`.
+//! the published `agent` rootfs straight from GHCR (no container runtime
+//! needed), boots it once, and persists the warmed guest as a snapshot in
+//! the default home.
 //!
 //! On first `run` (if setup was skipped) the runner also does a lazy
 //! auto-install if `initrd.cpio` is already in the resolved home but no
@@ -283,9 +283,8 @@ impl Default for HyperlightScriptRunner {
 /// pays no warmup cost. Intended to be called from a tool install
 /// step (npm postinstall, a `--setup-hyperlight` CLI flag, CI, etc.).
 ///
-/// Pulls the published rootfs from GHCR via docker or podman, boots it
-/// once, and persists the warmed guest as a snapshot. Zero configuration
-/// beyond having docker/podman on `$PATH`.
+/// Pulls the published rootfs from GHCR over the registry API, boots it
+/// once, and persists the warmed guest as a snapshot.
 ///
 /// # Destination
 ///
@@ -327,7 +326,7 @@ pub fn setup(force: bool, logger: &mut Logger) -> Result<PathBuf, String> {
         ));
     } else {
         logger.log_line(&format!(
-            "hyperlight setup: pulling {ROOTFS_IMAGE}:{ROOTFS_TAG} (docker/podman)"
+            "hyperlight setup: pulling {ROOTFS_IMAGE}:{ROOTFS_TAG}"
         ));
         pull_rootfs(&home.join(INITRD_FILE), logger)?;
         std::fs::write(home.join(VERSION_FILE), version_stamp())
@@ -984,94 +983,232 @@ fn with_network(
     }
 }
 
-/// Pull the rootfs CPIO out of the published image into `dst`, staged
-/// beside it and renamed into place so a failed pull leaves no
+/// Pull the rootfs CPIO out of the published image into `dst`, straight
+/// from the registry's distribution API: no container runtime needed.
+/// Staged beside `dst` and renamed into place so a failed pull leaves no
 /// half-written rootfs.
 fn pull_rootfs(dst: &Path, logger: &mut Logger) -> Result<(), String> {
-    use std::process::Command;
-
-    let tool = find_on_path(&["docker", "podman"]).ok_or_else(|| {
-        format!(
-            "neither docker nor podman is on $PATH; install one, or drop `{INITRD_FILE}` \
-             into the image home by hand"
-        )
-    })?;
-    let image = format!("{ROOTFS_IMAGE}:{ROOTFS_TAG}");
-    let run = |cmd: &mut Command, label: &str| -> Result<(), String> {
-        let out = cmd
-            .output()
-            .map_err(|e| format!("spawn {tool} {label}: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "{tool} {label} failed (exit {:?}): {}",
-                out.status.code(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        Ok(())
-    };
-
-    logger.log_line(&format!("hyperlight setup: {tool} pull {image}"));
-    run(Command::new(tool).args(["pull", &image]), "pull")?;
-
-    let cname = format!("mxc-hyperlight-rootfs-{}", std::process::id());
-    let _ = Command::new(tool).args(["rm", "-f", &cname]).output();
-    // A scratch image has no command, and `create` insists on one; any
-    // string does, the container is never started.
-    run(
-        Command::new(tool).args(["create", "--name", &cname, &image, "/"]),
-        "create",
-    )?;
-    let _cleanup = ContainerCleanup {
-        tool,
-        cname: &cname,
-    };
-
-    let staged = dst.with_file_name(format!(".{INITRD_FILE}.part"));
-    let staged_str = staged
-        .to_str()
-        .ok_or_else(|| format!("image home path {staged:?} is not valid UTF-8"))?;
-    run(
-        Command::new(tool).args(["cp", &format!("{cname}:{ROOTFS_PATH_IN_IMAGE}"), staged_str]),
-        "cp",
-    )?;
-    std::fs::rename(&staged, dst).map_err(|e| format!("move rootfs into place at {dst:?}: {e}"))
-}
-
-/// Removes the extraction container on drop, success or failure.
-struct ContainerCleanup<'a> {
-    tool: &'a str,
-    cname: &'a str,
-}
-
-impl Drop for ContainerCleanup<'_> {
-    fn drop(&mut self) {
-        let _ = std::process::Command::new(self.tool)
-            .args(["rm", "-f", self.cname])
-            .output();
+    // Staged per process, so two setups at once each pull their own copy.
+    let staged = dst.with_file_name(format!(".{INITRD_FILE}.{}.part", std::process::id()));
+    let pulled = oci::fetch_file(
+        ROOTFS_IMAGE,
+        ROOTFS_TAG,
+        ROOTFS_PATH_IN_IMAGE,
+        &staged,
+        logger,
+    );
+    if pulled.is_err() {
+        let _ = std::fs::remove_file(&staged);
     }
+    pulled?;
+    // Remove the old rootfs first: on Windows, rename cannot replace an
+    // existing destination.
+    let _ = std::fs::remove_file(dst);
+    if let Err(e) = std::fs::rename(&staged, dst) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(format!("move rootfs into place at {dst:?}: {e}"));
+    }
+    Ok(())
 }
 
-/// Return the first name in `names` present as an executable on `$PATH`.
-fn find_on_path(names: &[&'static str]) -> Option<&'static str> {
-    let path = std::env::var_os("PATH")?;
-    names.iter().copied().find(|name| {
-        std::env::split_paths(&path).any(|dir| {
-            let candidate = dir.join(name);
-            let Ok(md) = candidate.metadata() else {
-                return false;
+/// Just enough of the OCI distribution API to take one file out of a
+/// public image: an anonymous pull token, the manifest (through an index
+/// if the tag names one), and the layer tarballs, extracted as they
+/// stream in and checked against their digests.
+mod oci {
+    use std::io::Read;
+    use std::path::Path;
+    use std::time::Duration;
+
+    use sha2::{Digest, Sha256};
+    use wxc_common::logger::Logger;
+
+    const MANIFEST_TYPES: &str = "application/vnd.oci.image.manifest.v1+json, \
+         application/vnd.oci.image.index.v1+json, \
+         application/vnd.docker.distribution.manifest.v2+json, \
+         application/vnd.docker.distribution.manifest.list.v2+json";
+
+    /// Write the file at `path_in_image` inside `image:tag` to `dst`.
+    /// `image` is `<registry host>/<repository>`.
+    pub(super) fn fetch_file(
+        image: &str,
+        tag: &str,
+        path_in_image: &str,
+        dst: &Path,
+        logger: &mut Logger,
+    ) -> Result<(), String> {
+        let (registry, repo) = image
+            .split_once('/')
+            .ok_or_else(|| format!("image {image:?} names no registry host"))?;
+        // Bounded so a dead link fails instead of hanging setup; the body
+        // bound covers the largest layer on a slow link.
+        let agent = ureq::Agent::config_builder()
+            .timeout_resolve(Some(Duration::from_secs(30)))
+            .timeout_connect(Some(Duration::from_secs(30)))
+            .timeout_recv_response(Some(Duration::from_secs(60)))
+            .timeout_recv_body(Some(Duration::from_secs(30 * 60)))
+            .build()
+            .new_agent();
+        let token = pull_token(&agent, registry, repo)?;
+        let get = |url: String, accept: &str| -> Result<ureq::Body, String> {
+            agent
+                .get(&url)
+                .header("Authorization", &format!("Bearer {token}"))
+                .header("Accept", accept)
+                .call()
+                .map(|response| response.into_body())
+                .map_err(|e| format!("GET {url}: {e}"))
+        };
+
+        // A tag may name an index of per-platform manifests (a buildx push
+        // adds attestation manifests under an "unknown" platform too)
+        // rather than the manifest itself; take the linux/amd64 one.
+        let manifests_url = format!("https://{registry}/v2/{repo}/manifests");
+        let mut manifest = read_json(get(format!("{manifests_url}/{tag}"), MANIFEST_TYPES)?)?;
+        if let Some(entries) = manifest.get("manifests").and_then(|m| m.as_array()) {
+            let digest = entries
+                .iter()
+                .find(|m| {
+                    m["platform"]["os"] == "linux" && m["platform"]["architecture"] == "amd64"
+                })
+                .and_then(|m| m["digest"].as_str())
+                .ok_or_else(|| format!("{image}:{tag} has no linux/amd64 manifest"))?
+                .to_string();
+            manifest = read_json(get(format!("{manifests_url}/{digest}"), MANIFEST_TYPES)?)?;
+        }
+        let layers = manifest["layers"]
+            .as_array()
+            .ok_or_else(|| format!("{image}:{tag}: manifest lists no layers"))?;
+
+        let wanted = path_in_image.trim_start_matches('/');
+        let mut found = false;
+        for layer in layers {
+            let digest = layer["digest"]
+                .as_str()
+                .ok_or_else(|| format!("{image}:{tag}: a layer has no digest"))?;
+            let media_type = layer["mediaType"].as_str().unwrap_or_default();
+            if media_type.ends_with("zstd") {
+                return Err(format!(
+                    "{image}:{tag}: zstd-compressed layers are not supported"
+                ));
+            }
+            let size_mib = layer["size"].as_u64().unwrap_or(0) / (1024 * 1024);
+            logger.log_line(&format!(
+                "hyperlight setup: downloading {image}:{tag} layer {digest} ({size_mib} MiB)"
+            ));
+            let body = get(
+                format!("https://{registry}/v2/{repo}/blobs/{digest}"),
+                "application/octet-stream",
+            )?;
+            let mut blob = Digested::new(body.into_reader());
+            // A later layer's copy of the file replaces an earlier one's,
+            // as it does in the image.
+            found |= extract(&mut blob, media_type.ends_with("gzip"), wanted, dst)?;
+            // Read to the end so the digest covers the whole blob.
+            std::io::copy(&mut blob, &mut std::io::sink())
+                .map_err(|e| format!("read layer {digest}: {e}"))?;
+            let actual = blob.digest();
+            if actual != digest {
+                return Err(format!("layer {digest} arrived with digest {actual}"));
+            }
+        }
+        if found {
+            Ok(())
+        } else {
+            Err(format!("{image}:{tag} has no {path_in_image}"))
+        }
+    }
+
+    /// An anonymous pull token for `repo` from the registry's token
+    /// endpoint, in the layout GHCR uses.
+    fn pull_token(agent: &ureq::Agent, registry: &str, repo: &str) -> Result<String, String> {
+        let url = format!("https://{registry}/token?scope=repository:{repo}:pull");
+        let body = agent
+            .get(&url)
+            .call()
+            .map(|response| response.into_body())
+            .map_err(|e| format!("GET {url}: {e}"))?;
+        read_json(body)?["token"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| format!("{registry} token response carries no token"))
+    }
+
+    fn read_json(mut body: ureq::Body) -> Result<serde_json::Value, String> {
+        let bytes = body
+            .read_to_vec()
+            .map_err(|e| format!("read response: {e}"))?;
+        serde_json::from_slice(&bytes).map_err(|e| format!("parse response: {e}"))
+    }
+
+    /// Walk one layer tarball, writing the `wanted` entry to `dst` if it
+    /// is there.
+    fn extract(
+        blob: &mut impl Read,
+        gzipped: bool,
+        wanted: &str,
+        dst: &Path,
+    ) -> Result<bool, String> {
+        let reader: Box<dyn Read + '_> = if gzipped {
+            Box::new(flate2::read::GzDecoder::new(blob))
+        } else {
+            Box::new(blob)
+        };
+        let mut archive = tar::Archive::new(reader);
+        let mut found = false;
+        for entry in archive.entries().map_err(|e| format!("read layer: {e}"))? {
+            let mut entry = entry.map_err(|e| format!("read layer entry: {e}"))?;
+            let is_wanted = {
+                let path = entry.path().map_err(|e| format!("read layer entry: {e}"))?;
+                let name = path.to_string_lossy();
+                name.trim_start_matches("./").trim_start_matches('/') == wanted
             };
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                md.is_file() && md.permissions().mode() & 0o111 != 0
+            if !is_wanted {
+                continue;
             }
-            #[cfg(not(unix))]
-            {
-                md.is_file()
+            if !entry.header().entry_type().is_file() {
+                return Err(format!("{wanted} in the layer is not a regular file"));
             }
-        })
-    })
+            let mut file =
+                std::fs::File::create(dst).map_err(|e| format!("create {dst:?}: {e}"))?;
+            let written =
+                std::io::copy(&mut entry, &mut file).map_err(|e| format!("write {dst:?}: {e}"))?;
+            if written == 0 {
+                return Err(format!("{wanted} in the layer is empty"));
+            }
+            found = true;
+        }
+        Ok(found)
+    }
+
+    /// A reader that keeps the SHA-256 of everything read through it.
+    struct Digested<R> {
+        inner: R,
+        hasher: Sha256,
+    }
+
+    impl<R: Read> Digested<R> {
+        fn new(inner: R) -> Self {
+            Self {
+                inner,
+                hasher: Sha256::new(),
+            }
+        }
+
+        /// The digest of everything read so far, in the registry's
+        /// `sha256:<hex>` form.
+        fn digest(&self) -> String {
+            format!("sha256:{:x}", self.hasher.clone().finalize())
+        }
+    }
+
+    impl<R: Read> Read for Digested<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.hasher.update(&buf[..n]);
+            Ok(n)
+        }
+    }
 }
 
 /// One guest per process: the runner holds at most one sandbox, and the
