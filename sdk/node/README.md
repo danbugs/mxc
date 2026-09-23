@@ -303,7 +303,7 @@ console.log(result.stdout);
 | `seatbelt` | `process` | macOS | `0.7.0-alpha` | ✅ | [`docs/seatbelt/seatbelt-backend.md`](https://github.com/microsoft/mxc/blob/main/docs/seatbelt/seatbelt-backend.md) |
 | `windows_sandbox` | `vm` | Windows | `0.10.0-alpha` | Experimental | [`docs/windows-sandbox/windows-sandbox.md`](https://github.com/microsoft/mxc/blob/main/docs/windows-sandbox/windows-sandbox.md) |
 | `microvm` | `microvm` | Windows | `0.10.0-alpha` | Experimental | [`docs/nanvix-microvm/nanvix.md`](https://github.com/microsoft/mxc/blob/main/docs/nanvix-microvm/nanvix.md) — MicroVM via NanVix on Windows Hypervisor Platform |
-| `hyperlight` | (concrete only) | Windows x64 / Linux x64 | `0.10.0-alpha` | Experimental | No dedicated guide |
+| `hyperlight` | (concrete only) | Windows x64 / Linux x64 | `0.10.0-alpha` | Experimental | [`docs/hyperlight/hyperlight-backend.md`](https://github.com/microsoft/mxc/blob/main/docs/hyperlight/hyperlight-backend.md) — Hyperlight + Unikraft micro-VM on KVM / WHP |
 | `wslc` | (concrete only) | Windows | `0.9.0-alpha` | Stable | [`docs/wsl/wsl-container-getting-started.md`](https://github.com/microsoft/mxc/blob/main/docs/wsl/wsl-container-getting-started.md) |
 | `isolation_session` | (concrete only) | Windows | `0.9.0-alpha` | Stable | [`docs/isolation-session/oneshot.md`](https://github.com/microsoft/mxc/blob/main/docs/isolation-session/oneshot.md) |
 
