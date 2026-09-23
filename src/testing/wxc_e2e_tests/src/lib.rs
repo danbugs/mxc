@@ -255,17 +255,39 @@ pub fn run_lxc_config(config_file: &str, extra_args: &[&str]) -> CommandResult {
     run_executable(config_file, &exe, args)
 }
 
-/// Return whether the Hyperlight snapshot is installed at the default
-/// location (`%LOCALAPPDATA%\mxc-hyperlight\snapshot\index.json`).
-pub fn has_hyperlight_snapshot() -> bool {
-    let home = std::env::var_os("LOCALAPPDATA")
+/// The Hyperlight image home the runner resolves first: `MXC_HYPERLIGHT_HOME`
+/// when set, else `%LOCALAPPDATA%\mxc-hyperlight`.
+fn hyperlight_home() -> PathBuf {
+    if let Some(home) = std::env::var_os("MXC_HYPERLIGHT_HOME") {
+        return PathBuf::from(home);
+    }
+    std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             std::env::var_os("USERPROFILE")
                 .map(|v| PathBuf::from(v).join("AppData").join("Local"))
                 .unwrap_or_default()
-        });
-    let snapshot = home.join("mxc-hyperlight").join("snapshot").join("index.json");
+        })
+        .join("mxc-hyperlight")
+}
+
+/// Return whether `runtime`'s snapshot is installed in the default home
+/// (`%LOCALAPPDATA%\mxc-hyperlight\<runtime>\snapshot\index.json`).
+pub fn has_hyperlight_runtime(runtime: &str) -> bool {
+    hyperlight_home()
+        .join(runtime)
+        .join("snapshot")
+        .join("index.json")
+        .is_file()
+}
+
+/// Return whether the default Hyperlight runtime's snapshot is installed
+/// (`%LOCALAPPDATA%\mxc-hyperlight\agent\snapshot\index.json`).
+pub fn has_hyperlight_snapshot() -> bool {
+    let snapshot = hyperlight_home()
+        .join("agent")
+        .join("snapshot")
+        .join("index.json");
     if snapshot.is_file() {
         println!("Using Hyperlight snapshot at {}", snapshot.display());
         true

@@ -40,7 +40,8 @@
 //! else is already populated — so one eager install persists across
 //! shell sessions, across reboots, and across `cargo install` upgrades.
 //!
-//! An image home holds the guest rootfs (`initrd.cpio`), the warmed
+//! An image home holds one directory per guest runtime (`agent/`, `node/`,
+//! ...), each with that runtime's rootfs (`initrd.cpio`), its warmed
 //! `snapshot/` directory, and a `VERSION` stamp naming the rootfs release.
 //! The Unikraft kernel is embedded in the `hyperlight-unikraft` crate, so
 //! nothing else is downloaded. A snapshot loads only under a build with
@@ -52,10 +53,11 @@
 //!
 //! ## Setup
 //!
-//! `lxc-exec --setup-hyperlight` (or `wxc-exec --setup-hyperlight`) pulls
-//! the published `agent` rootfs straight from GHCR (no container runtime
+//! `lxc-exec --setup-hyperlight[=RUNTIME,...]` (or `wxc-exec`) pulls each
+//! runtime's published rootfs straight from GHCR (no container runtime
 //! needed), boots it once, and persists the warmed guest as a snapshot in
-//! the default home.
+//! the default home. `agent` is the default runtime; a request's
+//! `hyperlight.runtime` selects another.
 //!
 //! On first `run` (if setup was skipped) the runner also does a lazy
 //! auto-install if `initrd.cpio` is already in the resolved home but no
@@ -97,7 +99,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wxc_common::logger::Logger;
-use wxc_common::models::{ExecutionRequest, NetworkPolicy, ScriptResponse};
+use wxc_common::models::{ExecutionRequest, HyperlightRuntime, NetworkPolicy, ScriptResponse};
 use wxc_common::script_runner::ScriptRunner;
 use wxc_common::validator::{validate_network_policy_support, NetworkPolicySupport};
 
@@ -183,26 +185,59 @@ const SNAPSHOT_DIR: &str = "snapshot";
 /// Stamp `setup` writes beside the rootfs, naming the release it holds.
 const VERSION_FILE: &str = "VERSION";
 
-/// The published rootfs: the `agent` runtime (CPython plus numpy, pandas,
-/// scipy, scikit-learn, ...). Its `:initrd-<version>` tag wraps the runnable
-/// CPIO in a scratch image at [`ROOTFS_PATH_IN_IMAGE`].
-const ROOTFS_IMAGE: &str = "ghcr.io/hyperlight-dev/hyperlight-unikraft/agent";
 /// Pinned to the `hyperlight-unikraft` release in Cargo.toml: a rootfs
 /// only boots on the kernel and driver protocol of its own release.
 const ROOTFS_TAG: &str = "initrd-v0.14.1";
 const ROOTFS_PATH_IN_IMAGE: &str = "/initrd.cpio";
-/// Scratch memory for the agent image — upstream's own figure for it; the
-/// ML stack needs far more than the library's 256 MiB default.
-const SCRATCH_MB: usize = 1536;
 /// Where host directories appear in the guest: `/host/<basename>`.
 const GUEST_MOUNT_ROOT: &str = "/host";
+/// The executor whose `--setup-hyperlight` installs an image, for hints.
+const SETUP_BIN: &str = if cfg!(windows) {
+    "wxc-exec"
+} else {
+    "lxc-exec"
+};
+
+/// What a guest runtime is built from.
+struct RuntimeImage {
+    /// The published rootfs, `ghcr.io/<owner>/<repo>/<image>`, named as
+    /// the runtime is. Its `:initrd-<version>` tag wraps the runnable CPIO
+    /// in a scratch image at [`ROOTFS_PATH_IN_IMAGE`].
+    image: String,
+    /// Scratch memory for it: upstream's own figure, covering rootfs
+    /// extraction plus runtime start-up.
+    scratch_mb: usize,
+}
+
+fn runtime_image(runtime: HyperlightRuntime) -> RuntimeImage {
+    // Upstream's own scratch figures per image: rootfs extraction plus
+    // runtime start-up.
+    let scratch_mb = match runtime {
+        HyperlightRuntime::Agent => 1536,
+        HyperlightRuntime::Python | HyperlightRuntime::PythonShell | HyperlightRuntime::Bash => 256,
+        HyperlightRuntime::Node => 512,
+        HyperlightRuntime::DotnetJit => 768,
+    };
+    RuntimeImage {
+        image: format!(
+            "ghcr.io/hyperlight-dev/hyperlight-unikraft/{}",
+            runtime.name()
+        ),
+        scratch_mb,
+    }
+}
 
 const ERR_PROXY_POLICY: &str = "network proxy is not supported by the hyperlight backend";
 const ERR_WORKDIR: &str =
     "workingDirectory is not supported by the hyperlight backend -- guest has its own filesystem namespace";
-const ERR_NO_INSTALL_SOURCE: &str =
-    "no warmed snapshot and no rootfs to install from. drop `initrd.cpio` into the image \
-     home (or run `--setup-hyperlight`).";
+
+fn no_install_source(runtime: HyperlightRuntime) -> String {
+    let name = runtime.name();
+    format!(
+        "no warmed {name} snapshot and no rootfs to install from. drop `{INITRD_FILE}` into \
+         the runtime's directory of the image home (or run `--setup-hyperlight={name}`)."
+    )
+}
 
 // -- Runner ------------------------------------------------------------------
 
@@ -279,6 +314,15 @@ impl Default for HyperlightScriptRunner {
     }
 }
 
+/// The runtimes `--setup-hyperlight` was given: the default runtime for
+/// no names, otherwise each name parsed, the first unknown one reported.
+pub fn parse_runtimes(names: &[String]) -> Result<Vec<HyperlightRuntime>, String> {
+    if names.is_empty() {
+        return Ok(vec![HyperlightRuntime::default()]);
+    }
+    names.iter().map(|name| name.parse()).collect()
+}
+
 /// Eagerly install the warmed snapshot so the *first* run later
 /// pays no warmup cost. Intended to be called from a tool install
 /// step (npm postinstall, a `--setup-hyperlight` CLI flag, CI, etc.).
@@ -290,7 +334,7 @@ impl Default for HyperlightScriptRunner {
 ///
 /// `$MXC_HYPERLIGHT_HOME` if set, otherwise the OS-local default
 /// (`~/.local/share/mxc-hyperlight` on Linux, `%LOCALAPPDATA%\mxc-hyperlight` on
-/// Windows). We intentionally do NOT walk the runtime search chain
+/// Windows), with one directory per runtime under it. We intentionally do NOT walk the runtime search chain
 /// here — that would let a stale `<cwd>/.mxc-hyperlight/` from an old dev
 /// session short-circuit the install and leave the default home
 /// empty, which would make later runs from a different cwd fail.
@@ -300,47 +344,56 @@ impl Default for HyperlightScriptRunner {
 /// When `force` is false, an existing install for this release is a
 /// no-op; one left by another release is rebuilt. When `force` is true,
 /// the snapshot is rebuilt regardless.
-pub fn setup(force: bool, logger: &mut Logger) -> Result<PathBuf, String> {
-    let home = match std::env::var_os(HOME_ENV) {
+pub fn setup(
+    force: bool,
+    runtimes: &[HyperlightRuntime],
+    logger: &mut Logger,
+) -> Result<PathBuf, String> {
+    let root = match std::env::var_os(HOME_ENV) {
         Some(v) => PathBuf::from(v),
         None => HyperlightScriptRunner::default_home(),
     };
 
-    if !force && is_installed(&home) {
-        logger.log_line(&format!(
-            "hyperlight: snapshot already present at {:?}; nothing to do \
-             (pass --force to rebuild)",
-            home.join(SNAPSHOT_DIR)
-        ));
-        return Ok(home.join(SNAPSHOT_DIR));
-    }
+    for &runtime in runtimes {
+        let home = root.join(runtime.name());
+        if !force && is_installed(&home, runtime) {
+            logger.log_line(&format!(
+                "hyperlight: {} snapshot already present at {:?}; nothing to do \
+                 (pass --force to rebuild)",
+                runtime.name(),
+                home.join(SNAPSHOT_DIR)
+            ));
+            continue;
+        }
 
-    std::fs::create_dir_all(&home).map_err(|e| format!("create image home {home:?}: {e}"))?;
+        std::fs::create_dir_all(&home).map_err(|e| format!("create image home {home:?}: {e}"))?;
 
-    // A rootfs of this release already in the home is kept, so a rebuild
-    // (a stale snapshot, or --force after replacing it) only warms.
-    if has_install_source(&home) {
-        logger.log_line(&format!(
-            "hyperlight setup: rootfs present at {:?}",
-            home.join(INITRD_FILE)
-        ));
-    } else {
-        logger.log_line(&format!(
-            "hyperlight setup: pulling {ROOTFS_IMAGE}:{ROOTFS_TAG}"
-        ));
-        pull_rootfs(&home.join(INITRD_FILE), logger)?;
-        std::fs::write(home.join(VERSION_FILE), version_stamp())
-            .map_err(|e| format!("write {VERSION_FILE}: {e}"))?;
-    }
+        // A rootfs of this release already in the home is kept, so a rebuild
+        // (a stale snapshot, or --force after replacing it) only warms.
+        if has_install_source(&home, runtime) {
+            logger.log_line(&format!(
+                "hyperlight setup: rootfs present at {:?}",
+                home.join(INITRD_FILE)
+            ));
+        } else {
+            logger.log_line(&format!(
+                "hyperlight setup: pulling {}:{ROOTFS_TAG}",
+                runtime_image(runtime).image
+            ));
+            pull_rootfs(&home.join(INITRD_FILE), runtime, logger)?;
+            std::fs::write(home.join(VERSION_FILE), version_stamp(runtime))
+                .map_err(|e| format!("write {VERSION_FILE}: {e}"))?;
+        }
 
-    let (_, persisted) = warm_snapshot(&home, logger).map_err(|e| e.to_string())?;
-    if !persisted {
-        return Err(format!(
-            "the snapshot could not be put in place at {:?}; the log above says why",
-            home.join(SNAPSHOT_DIR)
-        ));
+        let (_, persisted) = warm_snapshot(&home, runtime, logger).map_err(|e| e.to_string())?;
+        if !persisted {
+            return Err(format!(
+                "the snapshot could not be put in place at {:?}; the log above says why",
+                home.join(SNAPSHOT_DIR)
+            ));
+        }
     }
-    Ok(home.join(SNAPSHOT_DIR))
+    Ok(root)
 }
 
 impl HyperlightScriptRunner {
@@ -359,10 +412,12 @@ impl HyperlightScriptRunner {
     /// discovery chain (see module doc) and returns the first
     /// location that has at least the rootfs — snapshot may be
     /// missing, the runner will install it.
-    fn resolve_home() -> Result<PathBuf, RunnerError> {
+    fn resolve_home(runtime: HyperlightRuntime) -> Result<PathBuf, RunnerError> {
+        let name = runtime.name();
         let mut stale = None;
-        for cand in Self::search_paths() {
-            if is_installed(&cand) || has_install_source(&cand) {
+        for root in Self::search_paths() {
+            let cand = root.join(name);
+            if is_installed(&cand, runtime) || has_install_source(&cand, runtime) {
                 return Ok(cand);
             }
             if stale.is_none() && cand.join(INITRD_FILE).is_file() {
@@ -373,16 +428,18 @@ impl HyperlightScriptRunner {
         let hint = match stale {
             Some(home) => format!(
                 "{home:?} holds a rootfs from another hyperlight-unikraft release; \
-                 run `lxc-exec --setup-hyperlight` to rebuild it."
+                 run `{SETUP_BIN} --setup-hyperlight={name}` to rebuild it."
             ),
             None => format!(
-                "run `lxc-exec --setup-hyperlight` \
-                 (or drop `{INITRD_FILE}` into {default:?})."
+                "run `{SETUP_BIN} --setup-hyperlight={name}` \
+                 (or drop `{INITRD_FILE}` into {:?}).",
+                default.join(name)
             ),
         };
         Err(RunnerError::Preflight(format!(
-            "no hyperlight image found. searched ${HOME_ENV}, {default:?}, \
-             <exe>/{EXE_RELATIVE_HOME}/, <cwd>/{CWD_RELATIVE_HOME}/. {hint}"
+            "no hyperlight image found for the {name} runtime. searched ${HOME_ENV}, \
+             {default:?}, <exe>/{EXE_RELATIVE_HOME}/, <cwd>/{CWD_RELATIVE_HOME}/, each under \
+             `{name}/`. {hint}"
         )))
     }
 
@@ -572,6 +629,7 @@ impl HyperlightScriptRunner {
     fn ensure_runtime(
         &mut self,
         home: &Path,
+        runtime: HyperlightRuntime,
         mounts: Vec<Mount>,
         network: NetworkKey,
         logger: &mut Logger,
@@ -599,7 +657,7 @@ impl HyperlightScriptRunner {
             Some(rewind) => rewind,
             None => {
                 configure_surrogates();
-                let rewind = load_persisted_snapshot(home, logger)?;
+                let rewind = load_persisted_snapshot(home, runtime, logger)?;
                 self.rewind = Some(rewind.clone());
                 rewind
             }
@@ -686,7 +744,12 @@ impl ScriptRunner for HyperlightScriptRunner {
     }
 
     fn execute(&mut self, request: &ExecutionRequest, logger: &mut Logger) -> ScriptResponse {
-        let home = match Self::resolve_home() {
+        let runtime = request
+            .hyperlight
+            .as_ref()
+            .map(|h| h.runtime)
+            .unwrap_or_default();
+        let home = match Self::resolve_home(runtime) {
             Ok(h) => h,
             Err(e) => {
                 logger.log_line(&e.to_string());
@@ -700,14 +763,19 @@ impl ScriptRunner for HyperlightScriptRunner {
                 return e.to_response();
             }
         };
-        let (guest, rewind) =
-            match self.ensure_runtime(&home, mounts, NetworkKey::from_request(request), logger) {
-                Ok(pair) => pair,
-                Err(e) => {
-                    logger.log_line(&e.to_string());
-                    return e.to_response();
-                }
-            };
+        let (guest, rewind) = match self.ensure_runtime(
+            &home,
+            runtime,
+            mounts,
+            NetworkKey::from_request(request),
+            logger,
+        ) {
+            Ok(pair) => pair,
+            Err(e) => {
+                logger.log_line(&e.to_string());
+                return e.to_response();
+            }
+        };
 
         let timeout = (request.script_timeout > 0).then(|| {
             logger.log_line(&format!(
@@ -833,13 +901,15 @@ fn drive_until(
 
 // -- Install -----------------------------------------------------------------
 
-/// Boot the rootfs in `home` without mounts, snapshot the warmed guest to
-/// `home/snapshot` (replacing any snapshot there), and hand it back.
 /// Boot the rootfs in `home`, save the warm image beside its snapshot
 /// directory and publish it there. The flag says whether the new layout
 /// is what now sits in the snapshot directory; when it is not, the image
 /// in memory is still this warm's and the log says what happened on disk.
-fn warm_snapshot(home: &Path, logger: &mut Logger) -> Result<(Arc<Snapshot>, bool), RunnerError> {
+fn warm_snapshot(
+    home: &Path,
+    runtime: HyperlightRuntime,
+    logger: &mut Logger,
+) -> Result<(Arc<Snapshot>, bool), RunnerError> {
     let snapshot_dir = home.join(SNAPSHOT_DIR);
     logger.log_line(&format!(
         "hyperlight: booting {:?} to warm a snapshot",
@@ -847,7 +917,7 @@ fn warm_snapshot(home: &Path, logger: &mut Logger) -> Result<(Arc<Snapshot>, boo
     ));
     let t = Instant::now();
     configure_surrogates();
-    let mut sandbox = rootfs_builder(home)
+    let mut sandbox = rootfs_builder(home, runtime)
         .boot()
         .map_err(|e| RunnerError::Runtime(format!("boot hyperlight rootfs: {e}")))?;
     // Saved beside the snapshot directory, so a failed save leaves whatever
@@ -937,7 +1007,11 @@ fn publish_snapshot(home: &Path, staged: &Path, snapshot_dir: &Path, logger: &mu
 
 /// The persisted snapshot in `home`, warming and persisting one first
 /// when there is none this build loads.
-fn load_persisted_snapshot(home: &Path, logger: &mut Logger) -> Result<Arc<Snapshot>, RunnerError> {
+fn load_persisted_snapshot(
+    home: &Path,
+    runtime: HyperlightRuntime,
+    logger: &mut Logger,
+) -> Result<Arc<Snapshot>, RunnerError> {
     let snapshot_dir = home.join(SNAPSHOT_DIR);
     let unloadable = match hyperlight_unikraft::load_snapshot(&snapshot_dir) {
         Ok(snapshot) => {
@@ -946,8 +1020,8 @@ fn load_persisted_snapshot(home: &Path, logger: &mut Logger) -> Result<Arc<Snaps
         }
         Err(e) => e,
     };
-    if !has_install_source(home) {
-        return Err(RunnerError::Preflight(ERR_NO_INSTALL_SOURCE.to_string()));
+    if !has_install_source(home, runtime) {
+        return Err(RunnerError::Preflight(no_install_source(runtime)));
     }
     logger.log_line(&match unloadable {
         hyperlight_unikraft::Error::SnapshotRelease { saved_by, .. } => format!(
@@ -959,7 +1033,7 @@ fn load_persisted_snapshot(home: &Path, logger: &mut Logger) -> Result<Arc<Snaps
              rootfs"
         ),
     });
-    let (snapshot, persisted) = warm_snapshot(home, logger)?;
+    let (snapshot, persisted) = warm_snapshot(home, runtime, logger)?;
     if !persisted {
         logger.log_line(
             "hyperlight: running from the warm image in memory; the next run warms again",
@@ -969,8 +1043,9 @@ fn load_persisted_snapshot(home: &Path, logger: &mut Logger) -> Result<Arc<Snaps
 }
 
 /// A builder for a fresh boot of the rootfs in `home`.
-fn rootfs_builder(home: &Path) -> SandboxBuilder {
-    SandboxBuilder::from_initrd(home.join(INITRD_FILE)).scratch_mb(SCRATCH_MB)
+fn rootfs_builder(home: &Path, runtime: HyperlightRuntime) -> SandboxBuilder {
+    SandboxBuilder::from_initrd(home.join(INITRD_FILE))
+        .scratch_mb(runtime_image(runtime).scratch_mb)
 }
 
 fn with_network(
@@ -987,11 +1062,11 @@ fn with_network(
 /// from the registry's distribution API: no container runtime needed.
 /// Staged beside `dst` and renamed into place so a failed pull leaves no
 /// half-written rootfs.
-fn pull_rootfs(dst: &Path, logger: &mut Logger) -> Result<(), String> {
+fn pull_rootfs(dst: &Path, runtime: HyperlightRuntime, logger: &mut Logger) -> Result<(), String> {
     // Staged per process, so two setups at once each pull their own copy.
     let staged = dst.with_file_name(format!(".{INITRD_FILE}.{}.part", std::process::id()));
     let pulled = oci::fetch_file(
-        ROOTFS_IMAGE,
+        &runtime_image(runtime).image,
         ROOTFS_TAG,
         ROOTFS_PATH_IN_IMAGE,
         &staged,
@@ -1177,6 +1252,7 @@ mod oci {
                 return Err(format!("{wanted} in the layer is empty"));
             }
             found = true;
+            break;
         }
         Ok(found)
     }
@@ -1225,25 +1301,26 @@ fn configure_surrogates() {
 
 /// A home has a snapshot this build loads, beside no rootfs of another
 /// release. The rootfs is only needed to warm, not to run.
-fn is_installed(home: &Path) -> bool {
-    stamp_matches(home) && hyperlight_unikraft::load_snapshot(home.join(SNAPSHOT_DIR)).is_ok()
+fn is_installed(home: &Path, runtime: HyperlightRuntime) -> bool {
+    stamp_matches(home, runtime)
+        && hyperlight_unikraft::load_snapshot(home.join(SNAPSHOT_DIR)).is_ok()
 }
 
 /// A home has a rootfs of this release — enough to warm a snapshot from.
 /// A rootfs with no stamp (dropped in by hand) is taken on trust; one
 /// stamped for another release is not, since it will not boot on this
 /// release's kernel.
-fn has_install_source(home: &Path) -> bool {
-    home.join(INITRD_FILE).is_file() && stamp_matches(home)
+fn has_install_source(home: &Path, runtime: HyperlightRuntime) -> bool {
+    home.join(INITRD_FILE).is_file() && stamp_matches(home, runtime)
 }
 
-fn version_stamp() -> String {
-    format!("rootfs: {ROOTFS_IMAGE}:{ROOTFS_TAG}\n")
+fn version_stamp(runtime: HyperlightRuntime) -> String {
+    format!("rootfs: {}:{ROOTFS_TAG}\n", runtime_image(runtime).image)
 }
 
-fn stamp_matches(home: &Path) -> bool {
+fn stamp_matches(home: &Path, runtime: HyperlightRuntime) -> bool {
     match std::fs::read_to_string(home.join(VERSION_FILE)) {
-        Ok(stamp) => stamp.trim() == version_stamp().trim(),
+        Ok(stamp) => stamp.trim() == version_stamp(runtime).trim(),
         Err(e) => e.kind() == std::io::ErrorKind::NotFound,
     }
 }
@@ -1316,8 +1393,8 @@ mod tests {
     #[test]
     fn is_installed_false_on_empty_dir() {
         let tmp = fresh_tmp("empty");
-        assert!(!is_installed(&tmp));
-        assert!(!has_install_source(&tmp));
+        assert!(!is_installed(&tmp, HyperlightRuntime::Agent));
+        assert!(!has_install_source(&tmp, HyperlightRuntime::Agent));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -1325,8 +1402,8 @@ mod tests {
     fn has_install_source_true_when_rootfs_present() {
         let tmp = fresh_tmp("install-src");
         std::fs::write(tmp.join(INITRD_FILE), b"").unwrap();
-        assert!(has_install_source(&tmp));
-        assert!(!is_installed(&tmp)); // snapshot still absent
+        assert!(has_install_source(&tmp, HyperlightRuntime::Agent));
+        assert!(!is_installed(&tmp, HyperlightRuntime::Agent)); // snapshot still absent
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -1335,16 +1412,58 @@ mod tests {
         let tmp = fresh_tmp("stale");
         std::fs::write(tmp.join(INITRD_FILE), b"").unwrap();
         // A stamp from an earlier release than ROOTFS_TAG names.
+        let agent = HyperlightRuntime::Agent;
         std::fs::write(
             tmp.join(VERSION_FILE),
-            format!("rootfs: {ROOTFS_IMAGE}:initrd-v0.13.0\n"),
+            format!("rootfs: {}:initrd-v0.13.0\n", runtime_image(agent).image),
         )
         .unwrap();
-        assert!(!has_install_source(&tmp));
-        assert!(!is_installed(&tmp));
+        assert!(!has_install_source(&tmp, agent));
+        assert!(!is_installed(&tmp, agent));
 
-        std::fs::write(tmp.join(VERSION_FILE), version_stamp()).unwrap();
-        assert!(has_install_source(&tmp));
+        std::fs::write(tmp.join(VERSION_FILE), version_stamp(agent)).unwrap();
+        assert!(has_install_source(&tmp, agent));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn rootfs_tag_follows_the_pinned_crate_release() {
+        let manifest =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+        let line = manifest
+            .lines()
+            .find(|l| l.starts_with("hyperlight-unikraft = "))
+            .expect("the crate dependency line");
+        let version = line
+            .split("version = \"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("a pinned version");
+        assert_eq!(ROOTFS_TAG, format!("initrd-v{version}"));
+    }
+
+    #[test]
+    fn a_runtime_only_takes_its_own_rootfs() {
+        let tmp = fresh_tmp("runtimes");
+        let agent = tmp.join(HyperlightRuntime::Agent.name());
+        let node = tmp.join(HyperlightRuntime::Node.name());
+        for dir in [&agent, &node] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(INITRD_FILE), b"").unwrap();
+            std::fs::write(
+                dir.join(VERSION_FILE),
+                version_stamp(HyperlightRuntime::Agent),
+            )
+            .unwrap();
+        }
+        assert!(has_install_source(&agent, HyperlightRuntime::Agent));
+        assert!(!has_install_source(&node, HyperlightRuntime::Node));
+        std::fs::write(
+            node.join(VERSION_FILE),
+            version_stamp(HyperlightRuntime::Node),
+        )
+        .unwrap();
+        assert!(has_install_source(&node, HyperlightRuntime::Node));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -1377,7 +1496,7 @@ mod tests {
             std::env::set_var("LOCALAPPDATA", &empty);
         }
 
-        let result = HyperlightScriptRunner::resolve_home();
+        let result = HyperlightScriptRunner::resolve_home(HyperlightRuntime::Agent);
 
         // Restore env before asserting so a failing assert can't leak.
         unsafe {

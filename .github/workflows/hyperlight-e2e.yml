@@ -67,11 +67,11 @@ jobs:
         if: steps.whp-check.outputs.whp_available == 'true'
         shell: pwsh
         run: |
-          # Pulls the agent rootfs straight from GHCR (no container runtime
-          # needed), boots it once, and saves the snapshot under
-          # %LOCALAPPDATA%\mxc-hyperlight, where the e2e tests look for it.
+          # Pulls each runtime's rootfs straight from GHCR (no container
+          # runtime needed), boots it once, and saves the snapshot under
+          # %LOCALAPPDATA%\mxc-hyperlight\<runtime>, where the e2e tests look.
           $binDir = Join-Path $env:GITHUB_WORKSPACE "src\target\x86_64-pc-windows-msvc\debug"
-          & "$binDir\wxc-exec.exe" --setup-hyperlight --debug 2>&1
+          & "$binDir\wxc-exec.exe" --setup-hyperlight=agent,python,node --debug 2>&1
           if ($LASTEXITCODE -ne 0) {
             Write-Host "::error::Hyperlight setup failed"
             exit 1
