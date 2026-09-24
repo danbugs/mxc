@@ -231,7 +231,8 @@ mod stable;
 mod state_aware;
 
 pub use experimental::{
-    OneShotWindowsSandbox, OneShotWslc, PortMapping, TestFeature, TransportProtocol,
+    HyperlightRuntime, OneShotHyperlight, OneShotWindowsSandbox, OneShotWslc, PortMapping,
+    TestFeature, TransportProtocol,
 };
 pub use network::{
     Network, NetworkAction, NetworkEgress, NetworkIngress, NetworkPeer, NetworkPort,

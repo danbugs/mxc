@@ -103,6 +103,7 @@ fn state_aware_common(
         process_container: None,
         seatbelt: None,
         ui: None,
+        hyperlight: None,
     }
 }
 

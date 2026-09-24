@@ -10,7 +10,8 @@ fn accepts_permanent_development_fields() {
         "process": {"commandLine": "echo"},
         "test": {"message": "this is a message"},
         "windowsSandbox": {},
-        "wslc": {}
+        "wslc": {},
+        "hyperlight": {}
     }"#;
 
     assert_valid(json);

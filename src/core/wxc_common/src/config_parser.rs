@@ -8,8 +8,8 @@ use crate::error::WxcError;
 use crate::logger::Logger;
 use crate::models::{
     CaptureDenialsConfig, CaptureDenialsMode, ContainerPolicy, ContainmentBackend,
-    ExecutionRequest, LifecycleConfig, LxcConfig, NetworkEnforcementMode, NetworkPolicy,
-    PortMapping, SeatbeltConfig, TelemetryConfig, TestFeatureConfig, UiPolicy,
+    ExecutionRequest, HyperlightConfig, LifecycleConfig, LxcConfig, NetworkEnforcementMode,
+    NetworkPolicy, PortMapping, SeatbeltConfig, TelemetryConfig, TestFeatureConfig, UiPolicy,
     WindowsSandboxConfig, WslcConfig,
 };
 use crate::mxc_error::MxcError;
@@ -914,6 +914,9 @@ fn present_backend_sections(cfg: &crate::common_request_ir::CommonRequestIR) -> 
     if cfg.windows_sandbox.is_some() {
         push(ContainmentBackend::WindowsSandbox);
     }
+    if cfg.hyperlight.is_some() {
+        push(ContainmentBackend::Hyperlight);
+    }
     sections
 }
 
@@ -1661,6 +1664,10 @@ fn normalize_common_request_ir(
         config
     });
 
+    let hyperlight = cfg.hyperlight.map(|h| HyperlightConfig {
+        runtime: h.runtime.unwrap_or_default(),
+    });
+
     let seatbelt = cfg.seatbelt.map(make_seatbelt_config);
     let telemetry = cfg.telemetry.map(|raw| TelemetryConfig {
         enabled: raw.enabled,
@@ -1701,6 +1708,7 @@ fn normalize_common_request_ir(
         telemetry,
         test_feature,
         windows_sandbox,
+        hyperlight,
         experimental_enabled: false,
         testing_features_enabled: false,
         dry_run: false,

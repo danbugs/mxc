@@ -205,6 +205,7 @@ fn policy_projection(request: &ExecutionRequest) -> Value {
         wslc,
         seatbelt,
         windows_sandbox,
+        hyperlight,
         // Telemetry settings do not affect enforcement.
         telemetry: _excluded_telemetry,
         // A placeholder feature with no enforcement effect.
@@ -286,6 +287,16 @@ fn policy_projection(request: &ExecutionRequest) -> Value {
         "windowsSandbox".into(),
         serde_json::to_value(windows_sandbox).unwrap_or(Value::Null),
     );
+    // The guest runtime picks the image the sandbox boots. Hashed as the
+    // effective value whenever the backend is Hyperlight, so an omitted
+    // section and an explicit default are one policy; other backends carry
+    // no key and hash as they did before the section existed.
+    if *containment == crate::models::ContainmentBackend::Hyperlight {
+        root.insert(
+            "hyperlight".into(),
+            serde_json::to_value(hyperlight.clone().unwrap_or_default()).unwrap_or(Value::Null),
+        );
+    }
 
     Value::Object(root)
 }
@@ -535,6 +546,26 @@ mod tests {
                 "wslc",
             ])
         );
+    }
+
+    #[test]
+    fn hyperlight_runtime_hashes_as_its_effective_value() {
+        use crate::models::{ContainmentBackend, HyperlightConfig, HyperlightRuntime};
+        let mut omitted = request();
+        omitted.containment = ContainmentBackend::Hyperlight;
+        let mut explicit_default = omitted.clone();
+        explicit_default.hyperlight = Some(HyperlightConfig::default());
+        let mut node = omitted.clone();
+        node.hyperlight = Some(HyperlightConfig {
+            runtime: HyperlightRuntime::Node,
+        });
+        assert_eq!(policy_hash(&omitted), policy_hash(&explicit_default));
+        assert_ne!(policy_hash(&omitted), policy_hash(&node));
+
+        let Value::Object(projection) = policy_projection(&request()) else {
+            panic!("policy projection must be an object");
+        };
+        assert!(!projection.contains_key("hyperlight"));
     }
 
     #[test]

@@ -280,6 +280,7 @@ pub(super) fn into_common_request_ir(
         seatbelt: seatbelt.into_option().map(convert_seatbelt),
         test_feature: None,
         windows_sandbox: None,
+        hyperlight: None,
     }
 }
 

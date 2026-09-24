@@ -246,6 +246,7 @@ pub(crate) fn into_common_request_ir(
         seatbelt: None,
         test_feature: None,
         windows_sandbox: None,
+        hyperlight: None,
     }
 }
 

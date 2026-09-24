@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use super::experimental::{OneShotWindowsSandbox, OneShotWslc, TestFeature};
+use super::experimental::{OneShotHyperlight, OneShotWindowsSandbox, OneShotWslc, TestFeature};
 use super::network::Network;
 use super::primitives::OptionalField;
 use super::stable::{
@@ -104,4 +104,7 @@ pub struct Request {
     /// Optional one-shot WSLC backend settings.
     #[serde(default)]
     pub wslc: OptionalField<OneShotWslc>,
+    /// Optional one-shot Hyperlight backend settings.
+    #[serde(default)]
+    pub hyperlight: OptionalField<OneShotHyperlight>,
 }

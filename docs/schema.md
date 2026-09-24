@@ -249,6 +249,10 @@ that can be executed independently.
         "portMappings": [                  // Host<->container port forwarding. TCP only -- the WSLC SDK runtime returns E_NOTIMPL for UDP, so the parser hard-rejects "udp" entries with a clear message.
             { "windowsPort": 8080, "containerPort": 80, "protocol": "tcp" }
         ]
+    },
+
+    "hyperlight": {                        // Hyperlight settings (v0.10+)
+        "runtime": "node"                  // Guest runtime: agent (default), python, python-shell, node, bash or dotnet-jit
     }
 }
 ```

@@ -371,6 +371,14 @@ export interface WslcConfig {
 }
 
 /**
+ * Hyperlight backend configuration
+ */
+export interface HyperlightConfig {
+  /** Guest runtime that `process.commandLine` is source for (default: "agent") */
+  runtime?: 'agent' | 'python' | 'python-shell' | 'node' | 'bash' | 'dotnet-jit';
+}
+
+/**
  * Port mapping for host↔container port forwarding.
  */
 export interface PortMapping {
@@ -439,6 +447,8 @@ export interface ContainerConfig {
   telemetry?: TelemetryConfig;
   /** WSLC SDK configuration for Linux containers from Windows */
   wslc?: WslcConfig;
+  /** Hyperlight backend configuration */
+  hyperlight?: HyperlightConfig;
   /** macOS Seatbelt sandbox configuration (macOS only) */
   seatbelt?: SeatbeltConfig;
   /** Cross-platform UI configuration */

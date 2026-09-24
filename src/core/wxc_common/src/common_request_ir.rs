@@ -32,4 +32,5 @@ pub(crate) struct CommonRequestIR {
     pub(crate) telemetry: Option<wire::Telemetry>,
     pub(crate) test_feature: Option<wire::TestFeature>,
     pub(crate) windows_sandbox: Option<wire::WindowsSandbox>,
+    pub(crate) hyperlight: Option<wire::Hyperlight>,
 }

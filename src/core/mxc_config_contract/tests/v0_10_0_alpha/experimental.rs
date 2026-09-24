@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+#[path = "experimental/hyperlight.rs"]
+mod hyperlight;
 #[path = "experimental/root.rs"]
 mod root;
 #[path = "experimental/test_and_telemetry.rs"]

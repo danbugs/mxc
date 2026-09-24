@@ -407,6 +407,7 @@ pub(crate) fn into_common_request_ir(
         telemetry: None,
         test_feature: None,
         windows_sandbox: None,
+        hyperlight: None,
     }
 }
 

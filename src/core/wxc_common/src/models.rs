@@ -77,8 +77,8 @@ impl ContainmentBackend {
             ContainmentBackend::Wslc => Some("wslc"),
             ContainmentBackend::Seatbelt => Some("seatbelt"),
             ContainmentBackend::IsolationSession => Some("isolationSession"),
+            ContainmentBackend::Hyperlight => Some("hyperlight"),
             ContainmentBackend::Bubblewrap
-            | ContainmentBackend::Hyperlight
             | ContainmentBackend::MicroVm
             | ContainmentBackend::Vm => None,
         }
@@ -962,6 +962,78 @@ pub struct TelemetryConfig {
     pub requested_sandbox_kind: Option<&'static str>,
 }
 
+/// Guest runtime for the Hyperlight backend: what `process.commandLine`
+/// is source for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HyperlightRuntime {
+    /// CPython with the data-science stack preloaded.
+    #[default]
+    Agent,
+    /// CPython.
+    Python,
+    /// CPython with a BusyBox shell.
+    #[serde(rename = "python-shell")]
+    PythonShell,
+    /// Node.js.
+    Node,
+    /// Bash with BusyBox.
+    Bash,
+    /// .NET with the JIT.
+    #[serde(rename = "dotnet-jit")]
+    DotnetJit,
+}
+
+impl HyperlightRuntime {
+    /// Every runtime the backend can install and run.
+    pub const ALL: [HyperlightRuntime; 6] = [
+        HyperlightRuntime::Agent,
+        HyperlightRuntime::Python,
+        HyperlightRuntime::PythonShell,
+        HyperlightRuntime::Node,
+        HyperlightRuntime::Bash,
+        HyperlightRuntime::DotnetJit,
+    ];
+
+    /// The wire spelling: the upstream image's name, also the runtime's
+    /// directory in an image home.
+    pub fn name(self) -> &'static str {
+        match self {
+            HyperlightRuntime::Agent => "agent",
+            HyperlightRuntime::Python => "python",
+            HyperlightRuntime::PythonShell => "python-shell",
+            HyperlightRuntime::Node => "node",
+            HyperlightRuntime::Bash => "bash",
+            HyperlightRuntime::DotnetJit => "dotnet-jit",
+        }
+    }
+}
+
+impl std::str::FromStr for HyperlightRuntime {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        HyperlightRuntime::ALL
+            .into_iter()
+            .find(|runtime| runtime.name() == s)
+            .ok_or_else(|| {
+                let known: Vec<&str> = HyperlightRuntime::ALL.iter().map(|r| r.name()).collect();
+                format!(
+                    "unknown hyperlight runtime {s:?}; expected one of {}",
+                    known.join(", ")
+                )
+            })
+    }
+}
+
+/// Hyperlight backend configuration (`hyperlight`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HyperlightConfig {
+    /// Guest runtime for the run.
+    pub runtime: HyperlightRuntime,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ExecutionRequest {
     /// Exact external contract that produced this request.
@@ -1027,6 +1099,8 @@ pub struct ExecutionRequest {
     pub test_feature: Option<TestFeatureConfig>,
     /// Windows Sandbox backend configuration.
     pub windows_sandbox: Option<WindowsSandboxConfig>,
+    /// Hyperlight backend configuration (used when containment == Hyperlight).
+    pub hyperlight: Option<HyperlightConfig>,
     /// Whether the --experimental flag was passed.
     pub experimental_enabled: bool,
     /// Whether the --allow-testing-features flag was passed. Gates testing-only,
