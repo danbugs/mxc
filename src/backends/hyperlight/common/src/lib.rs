@@ -1736,6 +1736,11 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split('"').next())
             .expect("a pinned version");
+        // A caret requirement would let a lockfile refresh take a later
+        // release whose kernel no longer boots the rootfs at ROOTFS_TAG.
+        let version = version
+            .strip_prefix('=')
+            .expect("an exact (`=`) requirement");
         assert_eq!(ROOTFS_TAG, format!("initrd-v{version}"));
     }
 
