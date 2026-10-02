@@ -1037,11 +1037,12 @@ dependencies = [
 
 [[package]]
 name = "hyperlight-unikraft"
-version = "0.14.1"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "450b70edab2988e0e755de8dc602982931f87a5db8f64608f6390a23a9b86e55"
+checksum = "a6e6b50679996e8f4fd4bdda4a181ace9bc7c7069186dc68e4f95010e8e9cd87"
 dependencies = [
  "cap-std",
+ "getrandom 0.4.2",
  "hyperlight-common",
  "hyperlight-host",
  "rustix",
